@@ -20,7 +20,13 @@
  *
  * 用法：
  *   srpipe <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h>
- *          [--margin M] [--nv12] [--sharpen A]
+ *          [--margin M] [--nv12] [--sharpen A] [--profile]
+ *          [--gpu] [--gpu-in] [--float-out] [--dump-tiles <f>]
+ *
+ *   --gpu       输出侧：GPU 做 RGB->NV12 + 锐化（与 NPU 并行）—— 默认开，省 CPU 热点
+ *   --gpu-in    输入侧：GPU 抠块。★实测【没用】，默认关，见 gpu_in_thread 上面的注释
+ *   --float-out 强制走 awnn 的浮点输出路（只用于 A/B 验证字节等价）
+ *   --dump-tiles 把这帧的瓦片组原样吐出，用于比 CPU/GPU 两条抠块路是否逐字节相同
  *
  * 默认输出平面 RGB（gbrp），配 ffmpeg 用。
  * ★--nv12 直接吐 NV12（Y 平面 + 交织 CbCr，2x2 下采样），为了喂 VE 硬编：
@@ -39,6 +45,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <awnn_lib.h>
+/* ★awnn_internal.h 只为拿 Awnn_Context_t 的结构定义（要绕开 awnn_run 的浮点反量化）。
+ *   它没有 include guard，而且里面是【定义】了两个全局数组 time_begin/time_end
+ *   —— awnn_lib.c 里也定义了同样两个，直接 include 会 multiple definition。
+ *   借宏给它们改个名绕过去。 */
+#define time_begin srpipe_unused_time_begin
+#define time_end   srpipe_unused_time_end
+#include "awnn_internal.h"
+#undef time_begin
+#undef time_end
 #include <pthread.h>
 #include <semaphore.h>
 #include <CL/cl.h>
@@ -48,6 +63,7 @@
 
 static void die(const char *m) { fprintf(stderr, "srpipe: %s\n", m); exit(1); }
 static void write_full(int fd, const void *buf, size_t n);   /* 定义在后面 */
+static double _ms(void);                                    /* 定义在后面 */
 
 /* ============================ GPU 转换（可选） ============================
  * 为什么单独开线程：转换和 NPU 是不同硬件，串行做等于白白浪费 NPU 那 486ms。
@@ -100,6 +116,37 @@ static const char *CL_SRC =
 "        for (int k = -1; k <= 1; k++) s9 += YT[c + j * w + k];\n"
 "    int v = (int)YT[c] + ((((int)YT[c] - s9 / 9) * sh) >> 8);\n"
 "    Y[c] = (uchar)(v < 16 ? 16 : (v > 235 ? 235 : v));\n"
+"}\n";
+
+/* ---- 输入侧：把整帧 gbrp「抠」成 NPU 要的瓦片布局 ----
+ * 纯数据搬运，不做任何数值变换 —— 所以能和 CPU 路径【逐字节】比对，
+ * 这是这条流水线里唯一一处可以做到完全等价验证的地方。
+ *
+ * 为什么要搬走：CPU 上这一趟是 8640 次 320 字节的跨行 memcpy
+ * （16 块 x 3 平面 x 180 行），实测比它搬运的数据量该有的时间贵几十倍，
+ * 而 CPU 正是 60°C 就降到 416MHz 的那个热区。
+ *
+ * 输出布局：tiles[(ty*nx+tx)][plane][y][x]，plane 顺序 G,B,R（与 gbrp 一致）。
+ */
+static const char *CL_IN_SRC =
+"__kernel void frame_to_tiles(__global const uchar *G, __global const uchar *B,\n"
+"                             __global const uchar *R, __global uchar *T,\n"
+"                             const int iw, const int ih, const int tw, const int th,\n"
+"                             const int nx, const int cw, const int ch, const int mg)\n"
+"{\n"
+"    int gx = get_global_id(0);          /* 0 .. nx*tw-1 */\n"
+"    int gy = get_global_id(1);          /* 0 .. NY*th-1 */\n"
+"    int tx = gx / tw, lx = gx - tx * tw;\n"
+"    int ty = gy / th, ly = gy - ty * th;\n"
+"    int sx = tx * cw - mg + lx;         /* 窗口左上角可以越界，靠钳制补边 */\n"
+"    int sy = ty * ch - mg + ly;\n"
+"    if (sx < 0) sx = 0; else if (sx >= iw) sx = iw - 1;\n"
+"    if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;\n"
+"    int i = sy * iw + sx, o = ly * tw + lx, plane = tw * th;\n"
+"    __global uchar *base = T + (size_t)(ty * nx + tx) * 3 * plane;\n"
+"    base[o]            = G[i];\n"
+"    base[plane + o]    = B[i];\n"
+"    base[2 * plane + o]= R[i];\n"
 "}\n";
 
 /* --- GPU 线程的共享状态（双缓冲）--- */
@@ -168,6 +215,96 @@ static void *gpu_thread(void *arg)
     return NULL;
 }
 
+/* ========================= 输入侧：GPU 抠块（可选） =========================
+ * 与输出侧各自一个线程 + 各自的 cl_command_queue。
+ * 刻意【不】把两件事塞进同一个线程：那样 gather(f+1) 会被 convert(f-1) 挡住，
+ * 排出来的周期是 NPU+GPU 串联（推算 1126ms），而不是 NPU 单独（686ms）。
+ * 两个线程各自的循环都只有单一职责，不用去证明一个交叉调度的时序是对的。
+ *
+ * 输入侧只保留【一帧在飞】：主线程拿空槽(read) -> 填 -> 丢给 GPU -> 等瓦片。
+ * 这一级 GPU 只需要跑赢 NPU（实测 gather 远小于 NPU），不需要更深。
+ */
+typedef struct {
+    int iw, ih, tw, th, cw, ch, nx, ny, margin;
+    size_t frame_in, tile_in, all_tiles;
+    unsigned char *src[3];            /* 主线程从管道读进来的整帧 gbrp */
+    unsigned char *tiles[2];          /* GPU 收集出来的瓦片组 */
+    sem_t free_slots;                 /* 计数 3：主线程等一个已被消费的 src 槽 */
+    sem_t in_full;                    /* 主线程 -> GPU：有一帧可抠 */
+    sem_t tiles_ready;                /* GPU -> 主线程：瓦片好了 */
+    volatile int slot_in, slot_out, stop;
+    volatile long posted, done;
+    double t_gpu;                     /* 抠块线程累计耗时(ms) */
+    cl_context ctx; cl_command_queue q; cl_kernel k;
+    cl_mem mG, mB, mR, mT;
+} gin_t;
+
+static void *gpu_in_thread(void *arg)
+{
+    gin_t *g = (gin_t *)arg;
+    int out_idx = 0;
+    for (;;) {
+        sem_wait(&g->in_full);
+        if (g->stop) break;
+        int i = g->slot_in, o = out_idx;
+        out_idx ^= 1;
+
+        double _t = _ms();
+        cl_int e;
+        size_t px = (size_t)g->iw * g->ih;
+        const unsigned char *s = g->src[i];
+        e  = clEnqueueWriteBuffer(g->q, g->mG, CL_TRUE, 0, px, s,          0, NULL, NULL);
+        e |= clEnqueueWriteBuffer(g->q, g->mB, CL_TRUE, 0, px, s + px,     0, NULL, NULL);
+        e |= clEnqueueWriteBuffer(g->q, g->mR, CL_TRUE, 0, px, s + 2 * px, 0, NULL, NULL);
+        if (e != CL_SUCCESS) { fprintf(stderr, "srpipe: GPU 上传失败 %d\n", (int)e); exit(1); }
+
+        size_t gsz[2] = { (size_t)g->nx * g->tw, (size_t)g->ny * g->th };
+        clEnqueueNDRangeKernel(g->q, g->k, 2, NULL, gsz, NULL, 0, NULL, NULL);
+        clEnqueueReadBuffer(g->q, g->mT, CL_TRUE, 0, g->all_tiles, g->tiles[o], 0, NULL, NULL);
+        clFinish(g->q);
+
+        g->t_gpu += _ms() - _t;
+        sem_post(&g->free_slots);
+        g->done++;
+        g->slot_out = o;          /* ★必须在 post 之前写，主线程 post 之后才读它 */
+        sem_post(&g->tiles_ready);
+    }
+    return NULL;
+}
+
+/* CPU 版同一件事 —— 保留它是为了能逐字节验证 GPU 路径（见 tools/gputiletest.sh） */
+static void gather_cpu(const unsigned char *fin, unsigned char *tiles, const gin_t *g)
+{
+    const size_t plane = (size_t)g->tw * g->th;
+    for (int ty = 0; ty < g->ny; ty++) {
+        for (int tx = 0; tx < g->nx; tx++) {
+            const int ox = tx * g->cw, oy = ty * g->ch;
+            const int x0 = ox - g->margin, y0 = oy - g->margin;
+            const int fast_x = (x0 >= 0 && x0 + g->tw <= g->iw);
+            unsigned char *blk = tiles + (size_t)(ty * g->nx + tx) * 3 * plane;
+            for (int c = 0; c < 3; c++) {
+                const unsigned char *src = fin + (size_t)c * g->iw * g->ih;
+                unsigned char *dst = blk + (size_t)c * plane;
+                for (int y = 0; y < g->th; y++) {
+                    int sy = y0 + y;
+                    if (sy < 0) sy = 0; else if (sy >= g->ih) sy = g->ih - 1;
+                    if (fast_x) {
+                        memcpy(dst + (size_t)y * g->tw, src + (size_t)sy * g->iw + x0, g->tw);
+                    } else {
+                        const unsigned char *srow = src + (size_t)sy * g->iw;
+                        unsigned char *drow = dst + (size_t)y * g->tw;
+                        for (int x = 0; x < g->tw; x++) {
+                            int sx = x0 + x;
+                            if (sx < 0) sx = 0; else if (sx >= g->iw) sx = g->iw - 1;
+                            drow[x] = srow[sx];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static ssize_t read_full(int fd, void *buf, size_t n)
 {
     size_t got = 0;
@@ -208,13 +345,18 @@ int main(int argc, char **argv)
     int tw = atoi(argv[5]), th = atoi(argv[6]);
     int margin = 0, out_nv12 = 0;
     float sharpen = 0.0f;
-    int profile = 0, use_gpu = 0;
+    int profile = 0, use_gpu = 0, use_gpu_in = 0;
+    const char *dump_tiles = NULL;
+    int force_float = 0;
     for (int i = 7; i < argc; i++) {
         if (!strcmp(argv[i], "--margin") && i + 1 < argc) margin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nv12")) out_nv12 = 1;
         else if (!strcmp(argv[i], "--sharpen") && i + 1 < argc) sharpen = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
+        else if (!strcmp(argv[i], "--gpu-in")) use_gpu_in = 1;
+        else if (!strcmp(argv[i], "--float-out")) force_float = 1;   /* A/B 用：强制走 awnn 浮点路 */
+        else if (!strcmp(argv[i], "--dump-tiles") && i + 1 < argc) dump_tiles = argv[++i];
     }
     if (sharpen < 0.0f) sharpen = 0.0f;
     if (iw <= 0 || ih <= 0 || scale <= 0 || tw <= 0 || th <= 0) die("参数不合法");
@@ -240,20 +382,109 @@ int main(int argc, char **argv)
                                       : (size_t)ow * oh * 3;
     const size_t rgb_bytes = (size_t)ow * oh * 3;   /* 组帧始终是平面 RGB */
     const size_t tile_in   = (size_t)tw * th * 3;
-    const size_t tile_out  = (size_t)stw * sth * 3;
 
     unsigned char *fin   = (unsigned char *)malloc(frame_in);
     unsigned char *fout  = (unsigned char *)malloc(rgb_bytes);   /* 平面 RGB 整帧 */
     unsigned char *yuv   = out_nv12 ? (unsigned char *)malloc(frame_out) : NULL;
-    unsigned char *tin   = (unsigned char *)malloc(tile_in);
-    unsigned char *tout  = (unsigned char *)malloc(tile_out);
-    if (!fin || !fout || !tin || !tout) die("malloc 失败");
+    const size_t all_tiles = (size_t)nx * ny * tile_in;          /* 一帧的全部瓦片 */
+    const size_t tile_out_bytes = (size_t)stw * sth * 3;         /* NPU 单块输出字节数 */
+    unsigned char *tiles = (unsigned char *)malloc(all_tiles);
+    unsigned char *qbuf  = (unsigned char *)malloc(tile_out_bytes);   /* 量化输出中转 */
+    if (!fin || !fout || !tiles || !qbuf) die("malloc 失败");
+    (void)qbuf;
+
+    /* ---- 抠块（输入侧）：几何对 CPU/GPU 两条路完全一样 ---- */
+    gin_t gin; memset(&gin, 0, sizeof(gin));
+    gin.iw = iw; gin.ih = ih; gin.tw = tw; gin.th = th;
+    gin.cw = cw; gin.ch = ch; gin.nx = nx; gin.ny = ny; gin.margin = margin;
+    gin.frame_in = frame_in; gin.tile_in = tile_in; gin.all_tiles = all_tiles;
+    gin.slot_in = 0; gin.slot_out = 0; gin.stop = 0; gin.posted = 0; gin.done = 0;
+    pthread_t gin_tid = 0;
+
+    if (use_gpu_in) {
+        cl_int e; cl_platform_id plat; cl_device_id dev; cl_uint nd;
+        if (clGetPlatformIDs(1, &plat, &nd) != CL_SUCCESS ||
+            clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, &nd) != CL_SUCCESS)
+            die("找不到 OpenCL GPU（装了 img-bxm-dkms 吗？modprobe pvrsrvkm）");
+        gin.ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &e);
+        gin.q   = clCreateCommandQueue(gin.ctx, dev, 0, &e);
+        cl_program pr = clCreateProgramWithSource(gin.ctx, 1, &CL_IN_SRC, NULL, &e);
+        if (clBuildProgram(pr, 1, &dev, "-cl-fast-relaxed-math", NULL, NULL) != CL_SUCCESS) {
+            char log[8192] = {0};
+            clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+            fprintf(stderr, "GPU 抠块内核编译失败:\n%s\n", log);
+            die("GPU 抠块内核编译失败");
+        }
+        gin.k = clCreateKernel(pr, "frame_to_tiles", &e);
+        cl_mem mG = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
+        cl_mem mB = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
+        cl_mem mR = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
+        gin.mT = clCreateBuffer(gin.ctx, CL_MEM_WRITE_ONLY, all_tiles, NULL, &e);
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 0, sizeof(cl_mem), &mG), "inG");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 1, sizeof(cl_mem), &mB), "inB");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 2, sizeof(cl_mem), &mR), "inR");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 3, sizeof(cl_mem), &gin.mT), "inT");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 4, sizeof(cl_int), &gin.iw), "inIW");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 5, sizeof(cl_int), &gin.ih), "inIH");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 6, sizeof(cl_int), &gin.tw), "inTW");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 7, sizeof(cl_int), &gin.th), "inTH");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 8, sizeof(cl_int), &gin.nx), "inNX");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 9, sizeof(cl_int), &gin.cw), "inCW");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k,10, sizeof(cl_int), &gin.ch), "inCH");
+        CL_CHECK_OR_DIE(clSetKernelArg(gin.k,11, sizeof(cl_int), &gin.margin), "inMG");
+        gin.mG = mG; gin.mB = mB; gin.mR = mR;
+        for (int i = 0; i < 3; i++) {
+            gin.src[i] = (unsigned char *)malloc(frame_in);
+            if (!gin.src[i]) die("GPU 抠块 src malloc 失败");
+        }
+        for (int i = 0; i < 2; i++) {
+            gin.tiles[i] = (unsigned char *)malloc(all_tiles);
+            if (!gin.tiles[i]) die("GPU 抠块 tiles malloc 失败");
+        }
+        sem_init(&gin.free_slots, 0, 3);
+        sem_init(&gin.in_full, 0, 0);
+        sem_init(&gin.tiles_ready, 0, 0);
+        pthread_create(&gin_tid, NULL, gpu_in_thread, &gin);
+        fprintf(stderr, "srpipe: GPU 抠块已启用（与 NPU 并行，瓦片 %zu KB/帧）\n",
+                all_tiles / 1024);
+    }
 
     awnn_init();
     Awnn_Context_t *ctx = awnn_create(nbg);
     if (!ctx) die("awnn_create 失败");
 
-    void *in_buffers[] = { tin };
+    /* ★★ 绕开 awnn_run 的浮点反量化。
+     *
+     * awnn_run 对 uint8 输出干的是：
+     *     for (j...) fp_data[j] = quantize_maps[i][*(data + j)];
+     * 每块 276 万个 float【写出去】（11MB），16 块就是每帧 177MB 的浮点写 ——
+     * 全在 CPU 上、全落在我原先标的"NPU 690ms"里。然后拼帧又把这 177MB 读回来
+     * 转字节。我们最终只要 0..255 的字节，这趟浮点往返纯属白烧。
+     *
+     * 改成：自己调 vip_run_network，直接拿量化后的 uint8，
+     * 用一张 256 项【字节】LUT 一步到位。数值与浮点路径逐字节等价
+     * （同一张 quantize_maps，同样的 (int)(v+0.5f) 再钳制）。
+     */
+    int raw_out = 0;
+    unsigned char lut[256];
+    {
+        int df = ctx->output_params[0].vip_param.data_format;
+        if (!force_float && ctx->output_count == 1 && df == VIP_BUFFER_FORMAT_UINT8 && ctx->quantize_maps[0]) {
+            for (int j = 0; j < 256; j++) {
+                int iv = (int)(ctx->quantize_maps[0][j] * 255.0f + 0.5f);
+                lut[j] = (unsigned char)(iv < 0 ? 0 : (iv > 255 ? 255 : iv));
+            }
+            raw_out = 1;
+            fprintf(stderr, "srpipe: NPU 输出是量化 uint8 -> 走字节 LUT，"
+                            "省掉每帧 177MB 的浮点反量化 + 回读\n");
+        } else {
+            fprintf(stderr, "srpipe: %s(data_format=%d, outputs=%u) -> 走 awnn 的浮点路径\n",
+                    force_float ? "被 --float-out 强制" : "NPU 输出不是量化 uint8",
+                    df, ctx->output_count);
+        }
+    }
+
+    void *in_buffers[1] = { tiles };
 
     /* ---- 可选：GPU 转换线程（双缓冲）---- */
     gpu_ctx_t gpu; gpu.stop = 0; gpu.t_conv = 0; gpu.frames = 0;
@@ -312,75 +543,110 @@ int main(int argc, char **argv)
     long frame = 0;
     for (;;) {
         double _t0=_ms();
-        if (read_full(STDIN_FILENO, fin, frame_in) <= 0) break;
-        t_read += _ms()-_t0; _t0=_ms();
+        /* --- 读一帧 + 抠成瓦片 ---
+         * GPU 路径：管道【直接读进】抠块线程的输入槽，主线程一个字节都不搬，
+         *           然后等它的瓦片（只留一帧在飞）。
+         * CPU 路径：读进 fin 再自己 gather。
+         * 两条路产出完全相同布局的 tiles，所以能逐字节比对（tools/gputiletest.sh）。 */
+        unsigned char *tb = tiles;
+        if (use_gpu_in) {
+            sem_wait(&gin.free_slots);
+            gin.slot_in = (int)(frame % 3);
+            if (read_full(STDIN_FILENO, gin.src[gin.slot_in], frame_in) <= 0) {
+                gin.stop = 1;                 /* 叫停抠块线程，别让它挂在 in_full 上 */
+                sem_post(&gin.in_full);
+                break;
+            }
+            t_read += _ms()-_t0; _t0=_ms();
+            gin.posted++;
+            sem_post(&gin.in_full);
+            sem_wait(&gin.tiles_ready);
+            tb = gin.tiles[gin.slot_out];
+        } else {
+            if (read_full(STDIN_FILENO, fin, frame_in) <= 0) break;
+            t_read += _ms()-_t0; _t0=_ms();
+            gather_cpu(fin, tiles, &gin);
+        }
+        t_tile += _ms()-_t0; _t0=_ms();
+
+        /* 调试/验证用：把这一帧的瓦片组原样吐出来，两条路（CPU / GPU）比对 */
+        if (dump_tiles) {
+            FILE *df = fopen(dump_tiles, "wb");
+            if (!df) die("打不开 --dump-tiles 的文件");
+            fwrite(tb, 1, all_tiles, df);
+            fclose(df);
+            fprintf(stderr, "DUMPED_TILES %s %zu bytes\n", dump_tiles, all_tiles);
+            _exit(0);
+        }
 
         for (int ty = 0; ty < ny; ty++) {
             for (int tx = 0; tx < nx; tx++) {
-                /* --- 抠块（含边界钳制，边缘块复制最后一行/列，不出黑边）--- */
-                const int ox = tx * cw, oy = ty * ch;        /* core 在源里的原点 */
-                const int x0 = ox - margin;                  /* 窗口左上角 */
-                /* ★快慢两条路：内块横向完全不越界，每行就是一段连续内存，直接 memcpy。
-                 *   原来逐字节 + 每像素两次比较 —— 实测 4.3MB 拷了 243ms（18MB/s），
-                 *   占了整帧的 15%，比 NPU 之外任何一步都贵。 */
-                const int fast_x = (x0 >= 0 && x0 + tw <= iw);
-                for (int c = 0; c < 3; c++) {
-                    const unsigned char *src = fin + (size_t)c * iw * ih;
-                    unsigned char *dst = tin + (size_t)c * tw * th;
-                    if (fast_x) {
-                        for (int y = 0; y < th; y++) {
-                            int sy = oy - margin + y;
-                            if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;
-                            memcpy(dst + (size_t)y * tw, src + (size_t)sy * iw + x0, tw);
+                /* 瓦片已经在 tb 里排好了，这里只是换个指针 —— 一次拷贝都没有 */
+                in_buffers[0] = tb + (size_t)(ty * nx + tx) * tile_in;
+                double _t1 = _ms();
+                awnn_set_input_buffers(ctx, in_buffers);
+                int lim = scw;
+                if (tx * scw + lim > ow) lim = ow - tx * scw;
+                if (lim < 0) lim = 0;
+
+                if (raw_out) {
+                    /* ---- 快路：直接拿量化 uint8 + 字节 LUT ---- */
+                    if (vip_run_network(ctx->network) != VIP_SUCCESS) die("vip_run_network 失败");
+                    t_npu += _ms()-_t1; _t1=_ms();
+                    vip_buffer ob = ctx->output_buffers[0];
+                    if (vip_flush_buffer(ob, VIP_BUFFER_OPER_TYPE_INVALIDATE) != VIP_SUCCESS)
+                        die("输出 buffer 失效化失败");
+                    const unsigned char *qm = (const unsigned char *)vip_map_buffer(ob);
+                    if (!qm) die("vip_map_buffer 失败");
+                    /* ★必须先整块 memcpy 出来：vip_map_buffer 给的通常是 uncached 映射，
+                     *   逐字节查表读它会退化成每字节一次设备内存访问 —— 实测反而慢 5 倍
+                     *   （84s vs 16s / 20 帧）。awnn 自己也是先 memcpy 再处理的。 */
+                    memcpy(qbuf, qm, tile_out_bytes);
+                    vip_unmap_buffer(ob);
+                    const unsigned char *q = qbuf;
+                    for (int c = 0; c < 3; c++) {
+                        const unsigned char *sp = q + (size_t)c * stw * sth;
+                        unsigned char *dstf = fout + (size_t)c * ow * oh;
+                        for (int y = 0; y < sch; y++) {
+                            int oy = ty * sch + y;
+                            if (oy >= oh) break;
+                            unsigned char *row = dstf + (size_t)oy * ow + tx * scw;
+                            const unsigned char *srow = sp + (size_t)(y + margin * scale) * stw
+                                                           + margin * scale;
+                            for (int x = 0; x < lim; x++) row[x] = lut[srow[x]];
                         }
-                    } else {
-                        for (int y = 0; y < th; y++) {
-                            int sy = oy - margin + y;
-                            if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;
-                            const unsigned char *srow = src + (size_t)sy * iw;
-                            unsigned char *drow = dst + (size_t)y * tw;
-                            for (int x = 0; x < tw; x++) {
-                                int sx = x0 + x;
-                                if (sx < 0) sx = 0; else if (sx >= iw) sx = iw - 1;
-                                drow[x] = srow[sx];
+                    }
+                } else {
+                    /* ---- 慢路：awnn 的浮点输出 ---- */
+                    awnn_run(ctx);
+                    float **out = awnn_get_output_buffers(ctx);
+                    t_npu += _ms()-_t1; _t1=_ms();
+                    if (!out || !out[0]) die("拿不到输出 buffer");
+                    const float *f = out[0];
+                    for (int c = 0; c < 3; c++) {
+                        const float *src = f + (size_t)c * stw * sth;
+                        unsigned char *dstf = fout + (size_t)c * ow * oh;
+                        for (int y = 0; y < sch; y++) {
+                            int oy = ty * sch + y;
+                            if (oy >= oh) break;
+                            unsigned char *row = dstf + (size_t)oy * ow + tx * scw;
+                            const float *srow = src + (size_t)(y + margin * scale) * stw
+                                                    + margin * scale;
+                            for (int x = 0; x < lim; x++) {
+                                float v = srow[x] * 255.0f;
+                                int iv = (int)(v + 0.5f);
+                                if (iv < 0) iv = 0; else if (iv > 255) iv = 255;
+                                row[x] = (unsigned char)iv;
                             }
                         }
                     }
                 }
-
-                t_tile += _ms()-_t0; _t0=_ms();
-                awnn_set_input_buffers(ctx, in_buffers);
-                awnn_run(ctx);
-                float **out = awnn_get_output_buffers(ctx);
-                t_npu += _ms()-_t0; _t0=_ms();
-                if (!out || !out[0]) die("拿不到输出 buffer");
-                const float *f = out[0];
-
-                /* --- 转 uint8 并放回整帧对应位置 --- */
-                for (int c = 0; c < 3; c++) {
-                    const float *src = f + (size_t)c * stw * sth;
-                    unsigned char *dstf = fout + (size_t)c * ow * oh;
-                    for (int y = 0; y < sch; y++) {
-                        int oy = ty * sch + y;                 /* ★输出坐标也按 core 步进 */
-                        if (oy >= oh) break;
-                        unsigned char *row = dstf + (size_t)oy * ow;
-                        /* 取块输出的中央有效区（去掉 margin 圈，输出是输入 scale 倍）*/
-                        const float *srow = src + (size_t)(y + margin * scale) * stw
-                                                + margin * scale;
-                        for (int x = 0; x < scw; x++) {
-                            int ox = tx * scw + x;
-                            if (ox >= ow) break;
-                            float v = srow[x] * 255.0f;
-                            int iv = (int)(v + 0.5f);
-                            if (iv < 0) iv = 0; else if (iv > 255) iv = 255;
-                            row[ox] = (unsigned char)iv;
-                        }
-                    }
-                }
+                /* ★按块计时（原来 _t0 在拼帧前才重置，t_tile 会把上一块的拼帧也算进去）*/
+                t_asm += _ms()-_t1;
             }
         }
 
-        t_asm += _ms()-_t0; _t0=_ms();
+        _t0 = _ms();
         if (use_gpu) {
             /* 把刚拼好的整帧交给 GPU 线程，自己不转 —— NPU 立刻去啃下一帧 */
             sem_wait(&gpu.empty);
@@ -474,6 +740,12 @@ int main(int argc, char **argv)
         frame++;
     }
 
+    if (use_gpu_in) {
+        while (gin.done < gin.posted) usleep(2000);
+        gin.stop = 1;
+        sem_post(&gin.in_full);
+        pthread_join(gin_tid, NULL);
+    }
     if (use_gpu) {
         /* ★必须先排空再停：直接设 stop 的话，线程拿到令牌就 break，
          *   正在排队的那一帧（最后一帧）会被丢掉。
@@ -486,15 +758,18 @@ int main(int argc, char **argv)
     awnn_destroy(ctx);
     awnn_uninit();
     close(data_fd);
+    if (use_gpu_in)
+        fprintf(stderr, "GPU 抠块: %ld 帧，合计 %.0f ms => %.2f ms/帧（与 NPU 并行）\n",
+                gin.done, gin.t_gpu, gin.done ? gin.t_gpu / gin.done : 0);
     if (use_gpu)
         fprintf(stderr, "GPU: %ld 帧，转换合计 %.0f ms => %.2f ms/帧\n",
                 gpu.frames, gpu.t_conv, gpu.frames ? gpu.t_conv / gpu.frames : 0);
     if (profile && frame > 0) {
         double tot=t_read+t_tile+t_npu+t_asm+t_yuv+t_sh+t_wr;
-        fprintf(stderr, "PROFILE %ld 帧  每帧 ms: 读入%.1f 抠块%.1f NPU(含去量化)%.1f "
+        fprintf(stderr, "PROFILE %ld 帧  每帧 ms: 读入%.1f %s%.1f NPU(含去量化)%.1f "
                         "拼帧%.1f RGB->NV12 %.1f 锐化%.1f 写出%.1f | 合计%.1f\n",
-                frame, t_read/frame, t_tile/frame, t_npu/frame, t_asm/frame,
-                t_yuv/frame, t_sh/frame, t_wr/frame, tot/frame);
+                frame, t_read/frame, use_gpu_in ? "等GPU抠块" : "抠块", t_tile/frame,
+                t_npu/frame, t_asm/frame, t_yuv/frame, t_sh/frame, t_wr/frame, tot/frame);
     }
     fprintf(stderr, "DONE %ld\n", frame);
     return 0;
