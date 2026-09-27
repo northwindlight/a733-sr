@@ -48,6 +48,17 @@ COOKIES  = _env("SR_COOKIES",   os.path.join(BASE, "bili_cookies.txt"))  # 可�
 # GPU 色彩转换开关。需要 img-bxm-dkms（/dev/dri/card1）+ libPVROCL。
 GPU_CONV = _env("SR_GPU", "1") not in ("0", "", "no", "false")
 
+# ★VE 硬解开关。把整片用专用硅解成 NV12 裸流落到 work 目录，之后的分段只做
+#   「seek + crop + 搬运」，软解和 swscale 都从 SR 阶段消失。
+#   尺子是【挪热点】：实测 SR 阶段那步 ffmpeg 的 CPU 从 15.9 ms/帧 降到 5.1 ms/帧。
+#   代价是多一个串行预pass（VE 解码本身只 2.95 ms/帧 CPU，但 NV12 落盘受 eMMC 限速，
+#   实测 ~22 ms/帧 wall），以及中间文件要占盘 —— 所以下面有容量闸，超了就退回软解。
+#   ★解码器用【系统自带】的 cedarc 库：我们自己编的那套 libawh264 会在
+#     H264DecoderInit 里段错误（见 deploy/ve-decode/README.md）。
+VE_DECODE = _env("SR_VE_DECODE", "1") not in ("0", "", "no", "false")
+VDEC_BIN  = _env("SR_VDEC_BIN",  os.path.join(BASE, "vdecpipe"))
+VE_MAX_INTERMEDIATE = int(_env("SR_VE_MAX_GB", "20")) << 30
+
 # ★块形状必须等于 NBG 的输入形状，两者是【一起定】的。
 # NBG 定形状 ⇒ 每块 NPU 代价固定（实测只与块数有关，与 core 面积无关），
 # 所以整帧代价 = 块数 x 常数，能优化的只有块数。旧 320x180 的 core 是 288x148，
@@ -259,6 +270,7 @@ def probe(path):
         "fps": fps, "has_audio": a is not None,
         "duration": float(info["format"].get("duration") or 0),
         "nb_frames": int(v.get("nb_frames") or 0),
+        "codec": v.get("codec_name") or "",
     }
 
 
@@ -315,6 +327,34 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         "frames": total_frames, "est_npu_s": round(est, 1),
     })
 
+    # ---------- 可选：VE 硬解预处理（整片 → NV12 裸流）----------
+    nv12_src = None                       # (文件, 对齐后的高)；None = 走软解
+    if VE_DECODE and meta.get("codec") == "h264" and os.path.exists(VDEC_BIN):
+        ah = (H + 15) // 16 * 16          # ★解码器输出的高按 16 对齐（960x540 -> 960x544）
+        need = W * ah * 3 // 2 * max(1, total_frames)
+        free = shutil.disk_usage(WORK).free
+        if need >= min(VE_MAX_INTERMEDIATE, free * 4 // 10):
+            set_job(jid, stage=f"源太大，NV12 中间文件要 {need/2**30:.1f}G —— 退回软解")
+        else:
+            raws = os.path.join(wd, "src.h264")
+            dump = os.path.join(wd, "src.nv12")
+            set_job(jid, stage="VE 硬解中（专用硅解码，这段 CPU 不参与）", progress=6)
+            # ① 抽裸流：解码器只吃 elementary stream，不吃 mp4 容器
+            run(["bash", "-c", f'ffmpeg -v error -nostdin -y -i {shq(src)} '
+                               f'-c:v copy -bsf:v h264_mp4toannexb -f h264 {shq(raws)}'], jid=jid)
+            # ② 硬解整片 → NV12。★-ss 0 -sn N 必须给：demo 默认「一帧都不存且不报错」
+            n = max(1, total_frames) + 8
+            run(["bash", "-c", f'LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu {shq(VDEC_BIN)} '
+                               f'-i {shq(raws)} -codFmat 1 -o {shq(dump)} -outFmat 6 '
+                               f'-n {n} -ss 0 -sn {n}'], jid=jid)
+            if os.path.getsize(dump) >= W * ah * 3 // 2:
+                nv12_src = (dump, ah)
+            else:
+                set_job(jid, stage="硬解没出东西，退回软解")
+            for f in (raws, dump) if not nv12_src else (raws,):
+                try: os.remove(f)
+                except OSError: pass
+
     # ---------- 分段处理 ----------
     t_sr_start = time.time()
     n_done = 0
@@ -334,11 +374,23 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
         gpu_arg = " --gpu" if GPU_CONV else ""
+        if nv12_src:
+            # VE 硬解路径：输入已是 NV12 裸流 ⇒ 只 seek + crop，不解码、不 swscale。
+            # 管道数据量也从 gbrp 的 3 字节/像素降到 NV12 的 1.5。
+            dump, ah = nv12_src
+            inarg = (f'-f rawvideo -pix_fmt nv12 -s {W}x{ah} '
+                     f'-ss {n_done / fps:.6f} -i {shq(dump)} -frames:v {chunk} '
+                     f'-vf crop={W}:{H}:0:0 -f rawvideo -')   # ★必须显式 :0:0 —— crop 默认是【居中】裁
+            nv12flag = " --in-nv12"
+        else:
+            # 软解路径：解码 + 缩放到源分辨率 + 转 gbrp 平面
+            inarg = (f'-ss {n_done / fps:.6f} -i {shq(src)} '
+                     f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo -')
+            nv12flag = ""
         cmd = (
-            f'ffmpeg -v error -nostdin -ss {n_done / fps:.6f} -i {shq(src)} '
-            f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
+            f'ffmpeg -v error -nostdin {inarg} '
             f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
-            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
+            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{nv12flag}{sh_arg}{gpu_arg} '
             f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
         )
         if cancel_requested(jid):
@@ -395,6 +447,11 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
 
         if got < chunk:
             break                                    # 源已经放完
+
+    # VE 硬解的中间产物用完就删 —— 它是整片源分辨率的 NV12，几百 MB 到几 GB
+    if nv12_src:
+        try: os.remove(nv12_src[0])
+        except OSError: pass
 
     if not parts:
         raise RuntimeError("没有产出任何编码段 —— 源视频可能读不出来")
