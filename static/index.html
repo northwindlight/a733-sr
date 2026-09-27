@@ -72,17 +72,14 @@
     </div>
 
     <div class="row">
-      <label>超分倍率</label>
-      <select id="scale">
-        <option value="2" selected>2×</option>
-        <option value="4">4×</option>
-      </select>
-      <label style="min-width:auto">最终分辨率</label>
-      <select id="target">
+      <label>输出</label>
+      <select id="res">
         <option value="720">720p</option>
         <option value="1080" selected>1080p</option>
         <option value="1440">1440p</option>
-        <option value="0">原生（源 × 倍率）</option>
+        <option value="2160">2160p（4K）</option>
+        <option value="src2">跟随源 ×2</option>
+        <option value="src4">跟随源 ×4</option>
       </select>
       <label style="min-width:auto">锐化</label>
       <select id="sharp">
@@ -99,9 +96,9 @@
       360p 源 ≈ 3.6 帧/秒 · 480p ≈ 2 帧/秒 · 720p ≈ 0.8 帧/秒。
       参数里已开启分块防接缝（2.25× 代价，换掉一条固定竖线）。
       <b>源分辨率越高越慢</b> —— 这是硬件决定的，不是可以调优的地方。<br>
-      <b>⚠ 倍率×源分辨率决定中间尺寸。</b>720p 源选 4× 会出 <b>5120×2880</b> 的中间帧，
-      光是把 4400 万像素/秒 的 RGB 转成 NV12 就能把 CPU 吃满 —— 慢的往往不是 NPU，是这一步。
-      想要 1080p 就直接选 1080p，别用"原生"。<br>
+      <b>模型是 x4 的</b>，所以 NPU 中间帧固定是<b>源×4</b>（UI 上会标出来），
+      再由 VE 缩放到你选的输出尺寸。慢的往往是中间帧那一步，不是 NPU。<br>
+      <b>"跟随源 ×N"</b> = 不做固定分辨率，直接按源的 N 倍输出。<br>
       <b>关于"油画感"</b>：这是 animevideov3 用在<b>实拍</b>素材上的固有毛病（它是给动画调的轻量模型）。
       锐化只能补边缘，补不回纹理。要根治得换实拍向的模型（realesr-general-x4v3，同架构、同代码路径、约 2× 慢）。
     </div>
@@ -124,11 +121,19 @@ function setBusy(b){
   $('#go').disabled = b; $('#goUrl').disabled = b;
 }
 
+// "输出"只有一个控件：给具体分辨率就用它，选"跟随源 ×N"就把倍率交给服务端算。
+// 原来"倍率"和"分辨率"是两个控件且互相打架 —— 设了分辨率后倍率被静默忽略，
+// 选 2× 和 4× 会产出完全一样的文件（实测确认过）。
+function readRes(){
+  const v = $('#res').value;
+  if(v.startsWith('src')) return {target: 0, scale: +v.slice(3)};
+  return {target: +v, scale: 2};
+}
+
 async function upload(file){
   const fd = new FormData();
-  const q = new URLSearchParams({
-    name: file.name, scale: $('#scale').value, target: $('#target').value,
-    sharp: $('#sharp').value });
+  const q = new URLSearchParams(Object.assign(
+    {name: file.name, sharp: $('#sharp').value}, readRes()));
   setBusy(true);
   // 用 XHR 才有上传进度
   const xhr = new XMLHttpRequest();
@@ -152,8 +157,7 @@ async function viaUrl(){
   setBusy(true);
   const r = await (await fetch('/api/url', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url, scale:+$('#scale').value, target:+$('#target').value,
-                            sharp:+$('#sharp').value})})).json();
+      body: JSON.stringify(Object.assign({url, sharp:+$('#sharp').value}, readRes()))})).json();
   setBusy(false);
   if(r.id) start(r.id); else alert(r.error || '失败');
 }
@@ -200,8 +204,9 @@ function render(){
     <div class="meta">
       <span>${(j.progress||0).toFixed(0)}%</span>
       ${j.frames_done ? `<span>${j.frames_done} 帧</span>`:''}
-      ${j.meta ? `<span>源 ${j.meta.src}</span><span>超分 ${j.meta.sr}</span>
-                  <span>输出 ${j.meta.final}</span>
+      ${j.meta ? `<span>源 ${j.meta.src}</span>
+                  <span>输出 <b style="color:#9fd0ff">${j.meta.final}</b></span>
+                  <span title="NBG 是 x4 的，中间帧必然是源×4，随后由 VE 缩放到输出尺寸">NPU 中间帧 ${j.meta.sr}</span>
                   <span>${j.meta.tiles} 块/帧</span>` : ''}
       ${j.size ? `<span>${(j.size/1048576).toFixed(1)} MB</span>`:''}
       ${j.took ? `<span>耗时 ${j.took}s</span>`:''}
