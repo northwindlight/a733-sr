@@ -117,15 +117,25 @@ Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码�
 
 ---
 
-## 依赖的两个外部件
+## 来源 —— 每样东西是从哪个仓库拿的
 
-这个仓库**不含**下面两样，`install.sh` 会去取：
+本仓库**只含自己写的代码**。其余外部件逐个列明出处、版本、许可，
+完整清单见 **[docs/PROVENANCE.md](docs/PROVENANCE.md)**，摘要：
 
-1. **NBG 模型** —— 由 [northwindlight/a733-npu](https://github.com/northwindlight/a733-npu)
-   从 ONNX 转换而来（Pegasus/ACUITY 工具链太重，不适合塞进本仓库）。
-   模型是 Real-ESRGAN `realesr-animevideov3`（BSD-3-Clause）。
-2. **VE 编解码库** —— Allwinner Tina SDK（`gitlab.com/tina5.0_aiot`）编出来的
-   `libvencoder` / `libvenc_codec` 那一套。见 [docs/RUNTIME.md](docs/RUNTIME.md)。
+| 件 | 从哪拿 | 本仓库是否转分发 |
+|---|---|---|
+| **NBG 模型** | [northwindlight/a733-npu](https://github.com/northwindlight/a733-npu) 的 Release `nbg-animevideov3-v3`（该仓库用 Pegasus/ACUITY 从 ONNX 转）<br>再上游：Real-ESRGAN `realesr-animevideov3.pth` @ [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) release `v0.2.5.0`（BSD-3-Clause） | ❌ `install.sh` 自动拉 |
+| **awnn API + VIP Lite**（NPU 用户态） | **`github.com/ZIFENG278/ai-sdk`** @ `fc90006d`（2025-10-20）<br>⚠️ **第三方镜像，不是全志官方仓库** | ❌ 用镜像里自带的 `~/ai-sdk` |
+| **VE 编解码库** | **`gitlab.com/tina5.0_aiot/media/cedarc-release/libcedarc_v2.0`** 分支 `product-aiot-stable`<br>（`libvenc_codec.so` / `libVE.so` 是该仓库 `library/toolchain-sunxi-aarch64-glibc-gcc-v1320/v2/` 里的预编译件）<br>⚠️ **Allwinner 专有二进制，许可不明** | ❌ 按 PROVENANCE §3.1 自己编 |
+| 板子固件 | Radxa A733 Debian 13 (trixie) 镜像 | — |
+| `libcedarc-dev-*-arm64` v1.0.7 | Radxa 源 `radxa-repo.github.io/a733-trixie-test`（2022 年构建，**编解码器不认 A733**，只作对照） | — |
+| ffmpeg 7.1.5 / caddy 2.6.2 / g++ 14.2 / python3.13+numpy | Debian 13 | — |
+| **yt-dlp** | ⚠️ Debian 源里那份 2025.04.30 **太老，B 站必然 412**，要换 [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) 的 standalone 二进制 | — |
+| 校准数据 DIV2K | `data.vision.ee.ethz.ch`（仅非商业研究）—— **只在 a733-npu 用到**，本仓库不涉及 | — |
+
+**两条最要紧的**：
+1. `ai-sdk` 是**第三方镜像**，官方不走公开 git，长期可用性没保证，请自行留档
+2. VE 那套是**专有二进制**，所以本仓库不转分发，只给构建配方
 
 ---
 
@@ -168,6 +178,7 @@ VE 编码器自带缩放，1080p→720p 免费。但**放大直接失败**
 | `deploy/sr-web.service` | systemd 单元 |
 | `tools/seamtest.py` | 接缝量化工具 |
 | `docs/RUNTIME.md` | 运维手册 + 完整踩坑记录 |
+| `docs/PROVENANCE.md` | **来源清单：每个外部件的出处/版本/许可** |
 
 ---
 

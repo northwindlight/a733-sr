@@ -26,6 +26,16 @@ for c in ffmpeg ffprobe yt-dlp caddy g++ python3; do
 done
 python3 -c 'import numpy' 2>/dev/null || die "缺 numpy —— sudo apt-get install -y python3-numpy"
 
+# ★Debian 源里的 yt-dlp 太老，下 B 站必然 HTTP 412。只警告不阻断（不上 B 站就用不着）
+YTDLP_V=$(yt-dlp --version 2>/dev/null || echo 0)
+if [ "${YTDLP_V%%.*}" -lt 2026 ] 2>/dev/null; then
+    printf '\033[1;33m注意\033[0m: yt-dlp 是 %s，太老 —— 下 B 站会 412。\n' "$YTDLP_V"
+    echo "      换成官方 standalone 二进制："
+    echo "        curl -L -o /usr/local/bin/yt-dlp \\"
+    echo "          https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64"
+    echo "        chmod 755 /usr/local/bin/yt-dlp"
+fi
+
 # ---------------------------------------------------------------- 1. 编 srpipe
 # ai-sdk 里的 awnn 源码 + VIP Lite 库
 if [ ! -d "$AI_SDK/examples/libawnn_viplite" ]; then
