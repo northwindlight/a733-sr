@@ -193,12 +193,16 @@ function render(){
   const cls = done ? 'done'
             : j.status === 'error' ? 'err'
             : j.status === 'cancelled' ? 'cancel' : 'run';
+  // ★阶段文字。之前模板里引用了 ${label} 但从没定义过 —— JS 直接抛
+  //   ReferenceError，整个 render() 挂掉，页面上什么都不显示（用户实测踩到）。
+  const label = done ? '完成'
+              : j.status === 'error' ? (j.stage === '已中断' ? '已中断' : '失败')
+              : j.status === 'cancelled' ? '已取消'
+              : (j.stage || '运行中');
   let html = `<div class="job">
     <div class="t">
       <span class="n">${esc(j.name || j.id || '')}</span>
-      <span class="tag ${cls}">${done ? '完成'
-        : j.status==='error' ? '失败'
-        : j.status==='cancelled' ? '已取消' : (j.stage||'')}</span>
+      <span class="tag ${cls}">${label.length > 14 ? '进行中' : esc(label)}</span>
     </div>
     <div class="bar"><i style="width:${j.progress||0}%"></i></div>
     <div class="stage">
