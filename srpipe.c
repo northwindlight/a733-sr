@@ -225,7 +225,7 @@ static void *gpu_thread(void *arg)
  * 这一级 GPU 只需要跑赢 NPU（实测 gather 远小于 NPU），不需要更深。
  */
 typedef struct {
-    int iw, ih, tw, th, cw, ch, nx, ny, margin;
+    int iw, ih, tw, th, cw, ch, nx, ny, margin, in_nv12;
     size_t frame_in, tile_in, all_tiles;
     unsigned char *src[3];            /* 主线程从管道读进来的整帧 gbrp */
     unsigned char *tiles[2];          /* GPU 收集出来的瓦片组 */
@@ -235,8 +235,8 @@ typedef struct {
     volatile int slot_in, slot_out, stop;
     volatile long posted, done;
     double t_gpu;                     /* 抠块线程累计耗时(ms) */
-    cl_context ctx; cl_command_queue q; cl_kernel k;
-    cl_mem mG, mB, mR, mT;
+    cl_context ctx; cl_command_queue q; cl_kernel k, k_nv12;
+    cl_mem mG, mB, mR, mT, mY, mUV;
 } gin_t;
 
 static void *gpu_in_thread(void *arg)
@@ -253,13 +253,20 @@ static void *gpu_in_thread(void *arg)
         cl_int e;
         size_t px = (size_t)g->iw * g->ih;
         const unsigned char *s = g->src[i];
-        e  = clEnqueueWriteBuffer(g->q, g->mG, CL_TRUE, 0, px, s,          0, NULL, NULL);
-        e |= clEnqueueWriteBuffer(g->q, g->mB, CL_TRUE, 0, px, s + px,     0, NULL, NULL);
-        e |= clEnqueueWriteBuffer(g->q, g->mR, CL_TRUE, 0, px, s + 2 * px, 0, NULL, NULL);
-        if (e != CL_SUCCESS) { fprintf(stderr, "srpipe: GPU 上传失败 %d\n", (int)e); exit(1); }
-
-        size_t gsz[2] = { (size_t)g->nx * g->tw, (size_t)g->ny * g->th };
-        clEnqueueNDRangeKernel(g->q, g->k, 2, NULL, gsz, NULL, 0, NULL, NULL);
+        if (g->in_nv12) {
+            e  = clEnqueueWriteBuffer(g->q, g->mY,  CL_TRUE, 0, px,     s,        0, NULL, NULL);
+            e |= clEnqueueWriteBuffer(g->q, g->mUV, CL_TRUE, 0, px / 2, s + px,   0, NULL, NULL);
+            if (e != CL_SUCCESS) { fprintf(stderr, "srpipe: GPU 上传失败 %d\n", (int)e); exit(1); }
+            size_t gsz[2] = { (size_t)g->nx * g->tw, (size_t)g->ny * g->th };
+            clEnqueueNDRangeKernel(g->q, g->k_nv12, 2, NULL, gsz, NULL, 0, NULL, NULL);
+        } else {
+            e  = clEnqueueWriteBuffer(g->q, g->mG, CL_TRUE, 0, px, s,          0, NULL, NULL);
+            e |= clEnqueueWriteBuffer(g->q, g->mB, CL_TRUE, 0, px, s + px,     0, NULL, NULL);
+            e |= clEnqueueWriteBuffer(g->q, g->mR, CL_TRUE, 0, px, s + 2 * px, 0, NULL, NULL);
+            if (e != CL_SUCCESS) { fprintf(stderr, "srpipe: GPU 上传失败 %d\n", (int)e); exit(1); }
+            size_t gsz[2] = { (size_t)g->nx * g->tw, (size_t)g->ny * g->th };
+            clEnqueueNDRangeKernel(g->q, g->k, 2, NULL, gsz, NULL, 0, NULL, NULL);
+        }
         clEnqueueReadBuffer(g->q, g->mT, CL_TRUE, 0, g->all_tiles, g->tiles[o], 0, NULL, NULL);
         clFinish(g->q);
 
@@ -271,6 +278,47 @@ static void *gpu_in_thread(void *arg)
     }
     return NULL;
 }
+
+/* NV12 版同一件事：一趟做完 NV12 -> RGB + 排成瓦片。
+ *
+ * 为什么需要它：VE 硬解吐出来的就是 NV12（用 vdecoderdemo 整片 dump，见 app.py），
+ * 而 NPU 要的是 G,B,R 平面瓦片。中间那步 ffmpeg 的 yuv->gbrp 是纯 CPU 开销，
+ * 直接在这里做掉。
+ *
+ * ★色度是【最近邻】上采样（每个像素取它 2x2 块的那对 UV）。ffmpeg 的 swscale
+ *   用的是更精细的插值，所以换路之后颜色会有极小差异 —— 但 Y（细节全在这）
+ *   是原样的，且输出还要过 VE 的 4:2:0 编码，色度精度不是瓶颈。已记在文档里。
+ * ★系数是 BT.601 有限范围的标准整数反变换，与 srpipe 输出侧用的正向系数
+ *   （从 ffmpeg 回归出来的那套）互为逆。
+ */
+static const char *CL_IN_NV12_SRC =
+"__kernel void nv12_to_tiles(__global const uchar *Yp, __global const uchar *UV,\n"
+"                            __global uchar *T,\n"
+"                            const int iw, const int ih, const int tw, const int th,\n"
+"                            const int nx, const int cw, const int ch, const int mg)\n"
+"{\n"
+"    int gx = get_global_id(0), gy = get_global_id(1);\n"
+"    int tx = gx / tw, lx = gx - tx * tw;\n"
+"    int ty = gy / th, ly = gy - ty * th;\n"
+"    int sx = tx * cw - mg + lx;\n"
+"    int sy = ty * ch - mg + ly;\n"
+"    if (sx < 0) sx = 0; else if (sx >= iw) sx = iw - 1;\n"
+"    if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;\n"
+"    int c = (int)Yp[sy * iw + sx] - 16; if (c < 0) c = 0;\n"
+"    int ui = (sy >> 1) * iw + ((sx >> 1) << 1);\n"
+"    int d = (int)UV[ui] - 128, e = (int)UV[ui + 1] - 128;\n"
+"    int r = (298 * c + 409 * e + 128) >> 8;\n"
+"    int g = (298 * c - 100 * d - 208 * e + 128) >> 8;\n"
+"    int b = (298 * c + 516 * d + 128) >> 8;\n"
+"    r = r < 0 ? 0 : (r > 255 ? 255 : r);\n"
+"    g = g < 0 ? 0 : (g > 255 ? 255 : g);\n"
+"    b = b < 0 ? 0 : (b > 255 ? 255 : b);\n"
+"    int o = ly * tw + lx, plane = tw * th;\n"
+"    __global uchar *base = T + (size_t)(ty * nx + tx) * 3 * plane;\n"
+"    base[o]             = (uchar)g;\n"
+"    base[plane + o]     = (uchar)b;\n"
+"    base[2 * plane + o] = (uchar)r;\n"
+"}\n";
 
 /* CPU 版同一件事 —— 保留它是为了能逐字节验证 GPU 路径（见 tools/gputiletest.sh） */
 static void gather_cpu(const unsigned char *fin, unsigned char *tiles, const gin_t *g)
@@ -299,6 +347,40 @@ static void gather_cpu(const unsigned char *fin, unsigned char *tiles, const gin
                             drow[x] = srow[sx];
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/* CPU 版 NV12 -> 瓦片。与上面的 GPU 内核【逐字节】对齐（同一套整数系数与钳制），
+ * 否则 tools/gputiletest.sh 会报不一致。 */
+static void gather_nv12_cpu(const unsigned char *fin, unsigned char *tiles, const gin_t *g)
+{
+    const unsigned char *Yp = fin, *UV = fin + (size_t)g->iw * g->ih;
+    const size_t plane = (size_t)g->tw * g->th;
+    for (int ty = 0; ty < g->ny; ty++) {
+        for (int tx = 0; tx < g->nx; tx++) {
+            const int x0 = tx * g->cw - g->margin, y0 = ty * g->ch - g->margin;
+            unsigned char *blk = tiles + (size_t)(ty * g->nx + tx) * 3 * plane;
+            unsigned char *G = blk, *B = blk + plane, *R = blk + 2 * plane;
+            for (int y = 0; y < g->th; y++) {
+                int sy = y0 + y;
+                if (sy < 0) sy = 0; else if (sy >= g->ih) sy = g->ih - 1;
+                const unsigned char *yrow = Yp + (size_t)sy * g->iw;
+                const unsigned char *urow = UV + (size_t)(sy >> 1) * g->iw;
+                for (int x = 0; x < g->tw; x++) {
+                    int sx = x0 + x;
+                    if (sx < 0) sx = 0; else if (sx >= g->iw) sx = g->iw - 1;
+                    int c = (int)yrow[sx] - 16; if (c < 0) c = 0;
+                    int d = (int)urow[(sx >> 1) << 1] - 128;
+                    int e = (int)urow[((sx >> 1) << 1) + 1] - 128;
+                    int r = (298 * c + 409 * e + 128) >> 8;
+                    int gg = (298 * c - 100 * d - 208 * e + 128) >> 8;
+                    int b = (298 * c + 516 * d + 128) >> 8;
+                    G[y * g->tw + x] = (unsigned char)(gg < 0 ? 0 : (gg > 255 ? 255 : gg));
+                    B[y * g->tw + x] = (unsigned char)(b  < 0 ? 0 : (b  > 255 ? 255 : b));
+                    R[y * g->tw + x] = (unsigned char)(r  < 0 ? 0 : (r  > 255 ? 255 : r));
                 }
             }
         }
@@ -345,7 +427,7 @@ int main(int argc, char **argv)
     int tw = atoi(argv[5]), th = atoi(argv[6]);
     int margin = 0, out_nv12 = 0;
     float sharpen = 0.0f;
-    int profile = 0, use_gpu = 0, use_gpu_in = 0;
+    int profile = 0, use_gpu = 0, use_gpu_in = 0, in_nv12 = 0;
     const char *dump_tiles = NULL;
     int force_float = 0;
     for (int i = 7; i < argc; i++) {
@@ -355,6 +437,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--gpu-in")) use_gpu_in = 1;
+        else if (!strcmp(argv[i], "--in-nv12")) in_nv12 = 1;
         else if (!strcmp(argv[i], "--float-out")) force_float = 1;   /* A/B 用：强制走 awnn 浮点路 */
         else if (!strcmp(argv[i], "--dump-tiles") && i + 1 < argc) dump_tiles = argv[++i];
     }
@@ -377,7 +460,8 @@ int main(int argc, char **argv)
     fprintf(stderr, "srpipe: %dx%d -> %dx%d  块 %dx%d (margin %d, core %dx%d)  %dx%d=%d 块/帧\n",
             iw, ih, ow, oh, tw, th, margin, cw, ch, nx, ny, nx * ny);
 
-    const size_t frame_in  = (size_t)iw * ih * 3;
+    const size_t frame_in  = in_nv12 ? (size_t)iw * ih * 3 / 2   /* NV12 = Y + 交织 CbCr */
+                                     : (size_t)iw * ih * 3;
     const size_t frame_out = out_nv12 ? (size_t)ow * oh * 3 / 2     /* NV12 = Y + 交织 CbCr(1/2) */
                                       : (size_t)ow * oh * 3;
     const size_t rgb_bytes = (size_t)ow * oh * 3;   /* 组帧始终是平面 RGB */
@@ -397,6 +481,7 @@ int main(int argc, char **argv)
     gin_t gin; memset(&gin, 0, sizeof(gin));
     gin.iw = iw; gin.ih = ih; gin.tw = tw; gin.th = th;
     gin.cw = cw; gin.ch = ch; gin.nx = nx; gin.ny = ny; gin.margin = margin;
+    gin.in_nv12 = in_nv12;
     gin.frame_in = frame_in; gin.tile_in = tile_in; gin.all_tiles = all_tiles;
     gin.slot_in = 0; gin.slot_out = 0; gin.stop = 0; gin.posted = 0; gin.done = 0;
     pthread_t gin_tid = 0;
@@ -415,11 +500,22 @@ int main(int argc, char **argv)
             fprintf(stderr, "GPU 抠块内核编译失败:\n%s\n", log);
             die("GPU 抠块内核编译失败");
         }
-        gin.k = clCreateKernel(pr, "frame_to_tiles", &e);
+        cl_program pr2 = clCreateProgramWithSource(gin.ctx, 1, &CL_IN_NV12_SRC, NULL, &e);
+        if (clBuildProgram(pr2, 1, &dev, "-cl-fast-relaxed-math", NULL, NULL) != CL_SUCCESS) {
+            char log[8192] = {0};
+            clGetProgramBuildInfo(pr2, dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+            fprintf(stderr, "GPU NV12 抠块内核编译失败:\n%s\n", log);
+            die("GPU NV12 抠块内核编译失败");
+        }
+        gin.k_nv12 = clCreateKernel(pr2, "nv12_to_tiles", &e);
+        gin.k = clCreateKernel(pr, "frame_to_tiles", &e);   /* NV12 走 k_nv12，这个用不上 */
         cl_mem mG = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
         cl_mem mB = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
         cl_mem mR = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
+        cl_mem mY = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih, NULL, &e);
+        cl_mem mUV = clCreateBuffer(gin.ctx, CL_MEM_READ_ONLY, (size_t)iw * ih / 2, NULL, &e);
         gin.mT = clCreateBuffer(gin.ctx, CL_MEM_WRITE_ONLY, all_tiles, NULL, &e);
+        gin.mY = mY; gin.mUV = mUV;
         CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 0, sizeof(cl_mem), &mG), "inG");
         CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 1, sizeof(cl_mem), &mB), "inB");
         CL_CHECK_OR_DIE(clSetKernelArg(gin.k, 2, sizeof(cl_mem), &mR), "inR");
@@ -433,6 +529,24 @@ int main(int argc, char **argv)
         CL_CHECK_OR_DIE(clSetKernelArg(gin.k,10, sizeof(cl_int), &gin.ch), "inCH");
         CL_CHECK_OR_DIE(clSetKernelArg(gin.k,11, sizeof(cl_int), &gin.margin), "inMG");
         gin.mG = mG; gin.mB = mB; gin.mR = mR;
+        {
+            cl_int e2 = CL_SUCCESS;
+            cl_mem a0 = in_nv12 ? mY : mG, a1 = in_nv12 ? mUV : mB, a2 = in_nv12 ? gin.mT : mR;
+            e2 |= clSetKernelArg(gin.k_nv12, 0, sizeof(cl_mem), &a0);
+            e2 |= clSetKernelArg(gin.k_nv12, 1, sizeof(cl_mem), &a1);
+            e2 |= clSetKernelArg(gin.k_nv12, 2, sizeof(cl_mem), &gin.mT);
+            /* ★NV12 内核签名是 (Yp, UV, T, iw, ih, tw, th, nx, cw, ch, mg) —— 11 个参数。
+             *   别照抄 gbrp 那 12 个的下标，会整体错位一格，而且“看着能跑”。 */
+            e2 |= clSetKernelArg(gin.k_nv12,  3, sizeof(cl_int), &gin.iw);
+            e2 |= clSetKernelArg(gin.k_nv12,  4, sizeof(cl_int), &gin.ih);
+            e2 |= clSetKernelArg(gin.k_nv12,  5, sizeof(cl_int), &gin.tw);
+            e2 |= clSetKernelArg(gin.k_nv12,  6, sizeof(cl_int), &gin.th);
+            e2 |= clSetKernelArg(gin.k_nv12,  7, sizeof(cl_int), &gin.nx);
+            e2 |= clSetKernelArg(gin.k_nv12,  8, sizeof(cl_int), &gin.cw);
+            e2 |= clSetKernelArg(gin.k_nv12,  9, sizeof(cl_int), &gin.ch);
+            e2 |= clSetKernelArg(gin.k_nv12, 10, sizeof(cl_int), &gin.margin);
+            CL_CHECK_OR_DIE(e2, "nv12 args");
+        }
         for (int i = 0; i < 3; i++) {
             gin.src[i] = (unsigned char *)malloc(frame_in);
             if (!gin.src[i]) die("GPU 抠块 src malloc 失败");
@@ -565,7 +679,8 @@ int main(int argc, char **argv)
         } else {
             if (read_full(STDIN_FILENO, fin, frame_in) <= 0) break;
             t_read += _ms()-_t0; _t0=_ms();
-            gather_cpu(fin, tiles, &gin);
+            if (in_nv12) gather_nv12_cpu(fin, tiles, &gin);
+            else         gather_cpu(fin, tiles, &gin);
         }
         t_tile += _ms()-_t0; _t0=_ms();
 

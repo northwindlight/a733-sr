@@ -1,0 +1,35 @@
+--- /tmp/vdorig.c	2026-09-28 01:32:27.387516825 +0800
++++ /tmp/cedarc_v2/demo/vdecoderDemo/vdecoderDemo.c	2026-09-28 01:30:48.251579241 +0800
+@@ -469,7 +469,6 @@
+         DisHeader = DisHeader->next;
+         node->next = NULL;
+         node->flag = 0;
+-        usleep(DISPLAY_COST_TIME * 1000); /* displaying one picture use some time */
+         logv(" display one picture. pts: %lld ", node->picture->nPts);
+         ReturnPicture(pVideoDec, node->picture);
+     }
+@@ -676,9 +675,13 @@
+         pthread_rwlock_wrlock(&pVideoDecoder->thread.rwrock);
+         state = pVideoDecoder->thread.state;
+         pthread_rwlock_unlock(&pVideoDecoder->thread.rwrock);
+-        if(state & DEMO_EXIT)
++        /* ★改过：原来这里 state & DEMO_EXIT 就自杀。DEMO_EXIT 含 parser 的错误位，
++         *   于是 parser 一报错，写文件和还图的线程就没了 —— 解码线程随后空转到
++         *   帧池耗尽（正好卡在帧缓冲数那么多帧上），进程活着、CPU 10%、文件不涨。
++         *   我们要的是"把片子解出来"，不是"播放"，所以只认解码器自己的退出。 */
++        if(state & DEMO_DECODER_EXIT && ValidPictureNum(pVideoDec, 0) <= 0)
+         {
+-            loge("[Chn%d] display thread receive an error signal, exit..... ", pVideoDecoder->nChannel);
++            logd("[Chn%d] display thread: decoder done, exit..... ", pVideoDecoder->nChannel);
+             break;
+         }
+         pPicture = RequestPicture(pVideoDec, 0/*the major stream*/);
+@@ -729,7 +732,7 @@
+             }
+ #endif
+             nTime = GetNowUs();
+-            addPictureToList(pVideoDec, pDisList, &DisHeader, &DisRear, pPicture);
++            ReturnPicture(pVideoDec, pPicture);   /* ★立刻还回去，不做显示列表 */
+         }
+         else
+         {
