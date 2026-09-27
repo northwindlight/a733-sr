@@ -45,6 +45,8 @@ VIP_LIB  = _env("SR_VIP_LIB",   os.path.join(BASE, "vendor/viplite"))
 NBG      = _env("SR_NBG",       os.path.join(BASE, "models", "anv3.nb"))
 VENC_BIN = _env("SR_VENC_BIN",  os.path.join(VENV_DIR, "vencoderdemo_v2"))
 COOKIES  = _env("SR_COOKIES",   os.path.join(BASE, "bili_cookies.txt"))  # 可选，有则能下更高清
+# GPU 色彩转换开关。需要 img-bxm-dkms（/dev/dri/card1）+ libPVROCL。
+GPU_CONV = _env("SR_GPU", "1") not in ("0", "", "no", "false")
 
 TILE_W, TILE_H = 320, 180      # 必须等于 NBG 的输入形状
 SR_SCALE       = 4             # 该 NBG 是 x4
@@ -322,11 +324,14 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         # 数据量也砍半：gbrp 3 字节/像素 -> NV12 1.5。
         # 锐化改由 srpipe 自己做（新路径里 ffmpeg 不参与后期了，不能让开关静默失效）。
         sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
+        # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
+        #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
+        gpu_arg = " --gpu" if GPU_CONV else ""
         cmd = (
             f'ffmpeg -v error -nostdin -ss {n_done / fps:.6f} -i {shq(src)} '
             f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
             f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
-            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg} '
+            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
             f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
         )
         if cancel_requested(jid):
