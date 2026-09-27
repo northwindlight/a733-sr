@@ -184,4 +184,21 @@ VE 编码器自带缩放，1080p→720p 免费。但**放大直接失败**
 
 ## 许可
 
-Apache-2.0。超分权重 `realesr-animevideov3` 为 BSD-3-Clause（Real-ESRGAN）。
+**MPL-2.0**（Mozilla Public License 2.0）—— 文件级 copyleft：
+改动本仓库的源文件要把改动也以 MPL-2.0 开放，但把它和别的代码链接、
+或用它做服务不触发传染。
+
+```
+This Source Code Form is subject to the terms of the Mozilla Public
+License, v. 2.0. If a copy of the MPL was not distributed with this
+file, You can obtain one at https://mozilla.org/MPL/2.0/.
+```
+
+**外部件各自的许可另算**，不受本仓库影响：
+
+| 件 | 许可 |
+|---|---|
+| 超分权重 `realesr-animevideov3` | BSD-3-Clause（Real-ESRGAN） |
+| `ai-sdk`（awnn / VIP Lite） | 未标许可（第三方镜像，见 PROVENANCE §2） |
+| Allwinner cedarc（VE 编解码） | 专有，未标许可（见 PROVENANCE §3） |
+| ffmpeg / caddy / numpy 等 | 各自的（Debian 包） |
