@@ -447,8 +447,25 @@ class H(BaseHTTPRequestHandler):
         return self._json({"error": "not found"}, 404)
 
 
+def sweep_stale():
+    """重启后，进程内那些 running 任务的线程已经没了 —— 标成「已中断」，
+    否则界面上会永远挂着一个假的进度条。"""
+    n = 0
+    with _lock:
+        for jid, j in _jobs.items():
+            if j.get("status") == "running":
+                j.update(status="error", stage="已中断", progress=100,
+                         error="服务重启了，这个任务没跑完（子进程已随服务一起收掉）。重传一次即可。")
+                n += 1
+        if n:
+            _save()
+    if n:
+        print(f"清理了 {n} 个僵死任务", flush=True)
+
+
 def main():
     _load()
+    sweep_stale()
     print(f"A733 视频超分服务  监听 0.0.0.0:{PORT}", flush=True)
     print(f"  NPU: {NBG}  块 {TILE_W}x{TILE_H} x{SR_SCALE} margin={MARGIN}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

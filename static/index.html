@@ -74,15 +74,15 @@
     <div class="row">
       <label>超分倍率</label>
       <select id="scale">
-        <option value="2">2×</option>
-        <option value="4" selected>4×</option>
+        <option value="2" selected>2×</option>
+        <option value="4">4×</option>
       </select>
       <label style="min-width:auto">最终分辨率</label>
       <select id="target">
-        <option value="0" selected>自动（源 × 倍率）</option>
         <option value="720">720p</option>
-        <option value="1080" >1080p</option>
+        <option value="1080" selected>1080p</option>
         <option value="1440">1440p</option>
+        <option value="0">原生（源 × 倍率）</option>
       </select>
       <label style="min-width:auto">锐化</label>
       <select id="sharp">
@@ -99,6 +99,9 @@
       360p 源 ≈ 3.6 帧/秒 · 480p ≈ 2 帧/秒 · 720p ≈ 0.8 帧/秒。
       参数里已开启分块防接缝（2.25× 代价，换掉一条固定竖线）。
       <b>源分辨率越高越慢</b> —— 这是硬件决定的，不是可以调优的地方。<br>
+      <b>⚠ 倍率×源分辨率决定中间尺寸。</b>720p 源选 4× 会出 <b>5120×2880</b> 的中间帧，
+      光是把 4400 万像素/秒 的 RGB 转成 NV12 就能把 CPU 吃满 —— 慢的往往不是 NPU，是这一步。
+      想要 1080p 就直接选 1080p，别用"原生"。<br>
       <b>关于"油画感"</b>：这是 animevideov3 用在<b>实拍</b>素材上的固有毛病（它是给动画调的轻量模型）。
       锐化只能补边缘，补不回纹理。要根治得换实拍向的模型（realesr-general-x4v3，同架构、同代码路径、约 2× 慢）。
     </div>
