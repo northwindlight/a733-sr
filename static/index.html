@@ -201,6 +201,12 @@ function render(){
         : j.status==='cancelled' ? '已取消' : (j.stage||'')}</span>
     </div>
     <div class="bar"><i style="width:${j.progress||0}%"></i></div>
+    <div class="stage">
+      ${j.status==='running' ? '<i class="dot"></i>' : ''}
+      <span>${esc(label)}</span>
+      ${j.fps_now ? `<span style="color:var(--dim);font-weight:400">· ${j.fps_now} 帧/秒</span>` : ''}
+      ${j.eta_s > 60 ? `<span style="color:var(--dim);font-weight:400">· 约剩 ${Math.round(j.eta_s/60)} 分</span>` : ''}
+    </div>
     <div class="meta">
       <span>${(j.progress||0).toFixed(0)}%</span>
       ${j.frames_done ? `<span>${j.frames_done} 帧</span>`:''}

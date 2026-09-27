@@ -144,6 +144,31 @@ def all_jobs():
 
 
 # ---------------------------------------------------------------- 工具
+def run_stream(jid, cmd, on_line):
+    """流式跑命令：逐行回调，用于 yt-dlp 这种要报进度的。
+    （原来用 run() 的 communicate() 会把输出全缓冲住 —— 下载期间界面
+      停在 2% 一动不动，看着像卡死。）"""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, bufsize=1, start_new_session=True)
+    _register(jid, p)
+    tail = []
+    try:
+        for line in p.stdout:
+            tail.append(line)
+            if len(tail) > 80:
+                tail.pop(0)
+            try:
+                on_line(line)
+            except Exception:
+                pass          # 进度解析失败绝不能影响下载
+        p.wait()
+    finally:
+        _unregister(jid, p)
+    if cancel_requested(jid):
+        raise Cancelled()
+    return p.returncode, "".join(tail)
+
+
 def run(cmd, jid=None, **kw):
     """跑一条命令，失败抛异常并带上 stderr 尾巴。可取消。"""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -235,6 +260,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     })
 
     # ---------- 分段处理 ----------
+    t_sr_start = time.time()
     n_done = 0
     parts = []
     idx = 0
@@ -281,8 +307,16 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
 
         n_done += got
         pct = 10 + (n_done / total_frames * 80 if total_frames else 0)
+        # ★ETA 按**实测速率**外推，不要用"NPU 理论耗时" —— 那个只算 NPU，
+        #   实测端到端是它的 3~4 倍（解码/组帧/NV12 转换/编码都算上），
+        #   报出来会严重低估，用户以为卡死了。
+        el = max(0.01, time.time() - t_sr_start)
+        rate = n_done / el
+        eta = int((total_frames - n_done) / rate) if (total_frames and rate > 0) else 0
         set_job(jid, progress=min(90, pct), frames_done=n_done,
-                stage=f"超分+编码 {n_done}/{total_frames or '?'} 帧")
+                fps_now=round(rate, 2), eta_s=eta,
+                stage=f"超分+编码 {n_done}/{total_frames or '?'} 帧"
+                      + (f"（约剩 {eta//60} 分）" if eta > 60 else ""))
         idx += 1
 
         if got < chunk:
@@ -326,16 +360,25 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
         if url:
             set_job(jid, stage="下载中（bilibili）", progress=2, status="running")
             dst = os.path.join(DATA, jid + ".src.mp4")
-            cmd = ["yt-dlp", "--no-playlist", "--no-update",
+            # --newline：让下载进度一条一行，不然会挤在一行里解析不到
+            cmd = ["yt-dlp", "--no-playlist", "--no-update", "--newline",
                    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
                    "--merge-output-format", "mp4", "-o", dst]
             if os.path.exists(COOKIES):
                 cmd += ["--cookies", COOKIES]
             cmd.append(url)
-            p = run(cmd, jid=jid)
-            if p.returncode != 0 or not os.path.exists(dst):
-                tail = "\n".join((p.stderr or p.stdout or "").strip().split("\n")[-8:])
-                raise RuntimeError("下载失败:\n" + tail)
+
+            def _on_dl(line):
+                m = re.search(r"\[download\]\s+([\d.]+)%", line)
+                if m:
+                    set_job(jid, progress=2 + float(m.group(1)) * 0.06,
+                            stage="下载中（bilibili）%s%%" % m.group(1))
+                elif line.startswith("[Merger]") or "[ffmpeg]" in line:
+                    set_job(jid, progress=8, stage="下载完成，正在合并音视频")
+
+            rc, out = run_stream(jid, cmd, _on_dl)
+            if rc != 0 or not os.path.exists(dst):
+                raise RuntimeError("下载失败:\n" + "\n".join(out.strip().split("\n")[-8:]))
             src = dst
         set_job(jid, status="running")
         if _run_lock.locked():
