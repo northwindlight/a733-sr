@@ -1,0 +1,21 @@
+[Unit]
+Description=A733 视频超分 Web 服务
+After=network.target
+# VE/NPU 设备就绪后再起
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=northwind
+Group=northwind
+WorkingDirectory=/opt/sr
+Environment=SR_PORT=8080
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/sr/app.py
+Restart=on-failure
+RestartSec=3
+# 任务产物放在 /opt/sr/data，允许写
+ReadWritePaths=/opt/sr
+
+[Install]
+WantedBy=multi-user.target

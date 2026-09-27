@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A733 视频超分</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#181b22; --panel2:#1f232c; --line:#2a2f3a;
+    --fg:#e6e9ef; --dim:#8b93a3; --acc:#4c8dff; --ok:#37c07a; --err:#ff5f56;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans CJK SC",sans-serif}
+  .wrap{max-width:880px;margin:0 auto;padding:28px 18px 64px}
+  h1{font-size:20px;margin:0 0 4px}
+  h1 small{color:var(--dim);font-weight:400;font-size:13px;margin-left:8px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:18px;margin-top:16px}
+  .drop{border:2px dashed var(--line);border-radius:10px;padding:30px 16px;text-align:center;
+        cursor:pointer;transition:.15s;color:var(--dim)}
+  .drop:hover,.drop.on{border-color:var(--acc);color:var(--fg);background:var(--panel2)}
+  .drop b{color:var(--fg);font-size:15px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  label{color:var(--dim);font-size:13px;min-width:76px}
+  select,input[type=text]{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+        border-radius:7px;padding:8px 10px;font:inherit;outline:none}
+  input[type=text]{flex:1;min-width:220px}
+  select:focus,input:focus{border-color:var(--acc)}
+  button{background:var(--acc);color:#fff;border:0;border-radius:7px;padding:9px 18px;
+         font:inherit;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.45;cursor:default}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg)}
+  .bar{height:8px;background:var(--panel2);border-radius:99px;overflow:hidden;margin-top:8px}
+  .bar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .4s}
+  .meta{color:var(--dim);font-size:12.5px;margin-top:8px;display:flex;gap:14px;flex-wrap:wrap}
+  .job{border-top:1px solid var(--line);padding:12px 0}
+  .job:first-child{border-top:0}
+  .job .t{display:flex;justify-content:space-between;gap:12px;align-items:center}
+  .job .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tag{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--panel2);
+       color:var(--dim);white-space:nowrap}
+  .tag.done{background:#12341f;color:var(--ok)}
+  .tag.err{background:#3a1717;color:var(--err)}
+  .tag.run{background:#12233f;color:var(--acc)}
+  pre.err{background:#241416;border:1px solid #4a1f22;color:#ffb3ad;padding:10px;
+          border-radius:7px;font-size:12px;overflow:auto;max-height:200px;white-space:pre-wrap}
+  a.dl{color:var(--ok);font-weight:600;text-decoration:none}
+  a.dl:hover{text-decoration:underline}
+  .hint{color:var(--dim);font-size:12.5px;margin-top:10px;line-height:1.7}
+  .hint b{color:#c8cedb}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>A733 视频超分 <small>NPU 超分 · VE 硬编 · 全本地</small></h1>
+
+  <div class="card">
+    <div class="drop" id="drop">
+      <b>拖视频到这里，或点击选择</b><br>
+      <span style="font-size:12.5px">任意格式，ffmpeg 能解就行</span>
+      <input type="file" id="file" accept="video/*" hidden>
+    </div>
+
+    <div class="row">
+      <label>或哔哩哔哩</label>
+      <input type="text" id="url" placeholder="https://www.bilibili.com/video/BV... 或 b23.tv 短链">
+    </div>
+
+    <div class="row">
+      <label>超分倍率</label>
+      <select id="scale">
+        <option value="2">2×</option>
+        <option value="4" selected>4×</option>
+      </select>
+      <label style="min-width:auto">最终分辨率</label>
+      <select id="target">
+        <option value="0" selected>自动（源 × 倍率）</option>
+        <option value="720">720p</option>
+        <option value="1080" >1080p</option>
+        <option value="1440">1440p</option>
+      </select>
+      <label style="min-width:auto">锐化</label>
+      <select id="sharp">
+        <option value="0">关</option>
+        <option value="0.4" selected>轻（推荐）</option>
+        <option value="0.8">强</option>
+      </select>
+      <button id="go">开始超分</button>
+      <button id="goUrl" class="ghost">用链接</button>
+    </div>
+
+    <div class="hint">
+      <b>速度参考</b>（NPU 代价 ∝ 源总像素，约 0.547 µs/像素）：
+      360p 源 ≈ 3.6 帧/秒 · 480p ≈ 2 帧/秒 · 720p ≈ 0.8 帧/秒。
+      参数里已开启分块防接缝（2.25× 代价，换掉一条固定竖线）。
+      <b>源分辨率越高越慢</b> —— 这是硬件决定的，不是可以调优的地方。<br>
+      <b>关于"油画感"</b>：这是 animevideov3 用在<b>实拍</b>素材上的固有毛病（它是给动画调的轻量模型）。
+      锐化只能补边缘，补不回纹理。要根治得换实拍向的模型（realesr-general-x4v3，同架构、同代码路径、约 2× 慢）。
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <b>任务</b>
+      <span class="meta" id="engine">…</span>
+    </div>
+    <div id="jobs"></div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let cur = null, timer = null;
+
+function setBusy(b){
+  $('#go').disabled = b; $('#goUrl').disabled = b;
+}
+
+async function upload(file){
+  const fd = new FormData();
+  const q = new URLSearchParams({
+    name: file.name, scale: $('#scale').value, target: $('#target').value,
+    sharp: $('#sharp').value });
+  setBusy(true);
+  // 用 XHR 才有上传进度
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?' + q);
+  xhr.upload.onprogress = e => {
+    if(e.lengthComputable) showProgress('上传中', e.loaded / e.total * 100);
+  };
+  xhr.onload = () => {
+    setBusy(false);
+    try { const r = JSON.parse(xhr.responseText);
+          if(r.id) start(r.id); else alert(r.error || '上传失败'); }
+    catch(e){ alert('上传失败'); }
+  };
+  xhr.onerror = () => { setBusy(false); alert('上传失败'); };
+  xhr.send(file);
+}
+
+async function viaUrl(){
+  const url = $('#url').value.trim();
+  if(!url) return alert('填个链接');
+  setBusy(true);
+  const r = await (await fetch('/api/url', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, scale:+$('#scale').value, target:+$('#target').value,
+                            sharp:+$('#sharp').value})})).json();
+  setBusy(false);
+  if(r.id) start(r.id); else alert(r.error || '失败');
+}
+
+function showProgress(stage, pct){
+  cur = {stage, progress: pct, status:'running'};
+  render();
+}
+
+function start(id){
+  cur = {id, stage:'排队', progress:1, status:'running'};
+  render();
+  if(timer) clearInterval(timer);
+  timer = setInterval(async () => {
+    const j = await (await fetch('/api/status?id=' + id)).json();
+    if(j.error) return;
+    cur = j; render();
+    if(j.status === 'done' || j.status === 'error'){ clearInterval(timer); timer = null; }
+  }, 900);
+}
+
+function render(){
+  const j = cur;
+  if(!j) return;
+  const done = j.status === 'done';
+  const cls = done ? 'done' : (j.status === 'error' ? 'err' : 'run');
+  let html = `<div class="job">
+    <div class="t">
+      <span class="n">${esc(j.name || j.id || '')}</span>
+      <span class="tag ${cls}">${done ? '完成' : (j.status==='error'?'失败':(j.stage||''))}</span>
+    </div>
+    <div class="bar"><i style="width:${j.progress||0}%"></i></div>
+    <div class="meta">
+      <span>${(j.progress||0).toFixed(0)}%</span>
+      ${j.frames_done ? `<span>${j.frames_done} 帧</span>`:''}
+      ${j.meta ? `<span>源 ${j.meta.src}</span><span>超分 ${j.meta.sr}</span>
+                  <span>输出 ${j.meta.final}</span>
+                  <span>${j.meta.tiles} 块/帧</span>` : ''}
+      ${j.size ? `<span>${(j.size/1048576).toFixed(1)} MB</span>`:''}
+      ${j.took ? `<span>耗时 ${j.took}s</span>`:''}
+      ${done ? `<a class="dl" href="/api/download?id=${j.id||''}&name=${encodeURIComponent((j.name||'sr').replace(/\.[^.]+$/,''))}">下载</a>`:''}
+    </div>
+    ${j.error ? `<pre class="err">${esc(j.error)}</pre>`:''}
+  </div>`;
+  $('#jobs').innerHTML = html;
+}
+
+function esc(s){ return String(s).replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+$('#drop').onclick = () => $('#file').click();
+$('#file').onchange = e => { if(e.target.files[0]) upload(e.target.files[0]); };
+['dragenter','dragover'].forEach(ev => $('#drop').addEventListener(ev, e => {
+  e.preventDefault(); $('#drop').classList.add('on'); }));
+['dragleave','drop'].forEach(ev => $('#drop').addEventListener(ev, e => {
+  e.preventDefault(); $('#drop').classList.remove('on'); }));
+$('#drop').addEventListener('drop', e => {
+  if(e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]); });
+$('#goUrl').onclick = viaUrl;
+$('#go').onclick = () => $('#file').click();
+
+fetch('/api/jobs').then(r=>r.json()).then(d=>{
+  $('#engine').textContent = '共 ' + d.jobs.length + ' 个任务';
+}).catch(()=>{});
+</script>
+</body>
+</html>

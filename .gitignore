@@ -1,0 +1,22 @@
+# 模型：从 a733-npu 的 Release 拉，不进仓库
+*.nb
+models/
+
+# 编译产物
+srpipe
+*.o
+
+# 运行期数据与临时文件
+data/
+work/
+__pycache__/
+*.pyc
+
+# ★凭据：绝不提交
+bili_cookies.txt
+cookies.txt
+*.env
+keys.env
+
+# 厂商库（体积大 + 许可另说）
+vendor/

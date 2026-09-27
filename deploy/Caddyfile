@@ -1,0 +1,17 @@
+# A733 视频超分 —— 本机反代（只监听内网，不对外）
+# 浏览器直接开 http://<板子IP>/ 即可
+:80 {
+	encode gzip
+	reverse_proxy 127.0.0.1:8080 {
+		# 大文件上传/下载不要缓冲，否则进度条会卡在 100% 不动
+		flush_interval -1
+		transport http {
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+	log {
+		output file /var/log/caddy/sr.log
+		format console
+	}
+}
