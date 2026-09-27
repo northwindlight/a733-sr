@@ -12,7 +12,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 SR_DIR=${SR_DIR:-/opt/sr}
 RUN_USER=${SR_RUN_USER:-${SUDO_USER:-$(id -un)}}
 AI_SDK=${AI_SDK:-$HOME/ai-sdk}
-NBG_URL=${NBG_URL:-https://github.com/northwindlight/a733-npu/releases/download/nbg-animevideov3-v3/network_binary.nb}
+NBG_URL=${NBG_URL:-https://github.com/northwindlight/a733-npu/releases/download/nbg-animevideov3_352x224-v3/network_binary.nb}
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; exit 1; }
@@ -72,12 +72,12 @@ install -m644 "$REPO/README.md"     "$SR_DIR/README.md"
 # VIP 运行库：拷进来，免得到处配 LD_LIBRARY_PATH
 cp -a "$VIP_SRC"/libNBGlinker.so "$VIP_SRC"/libVIPhal.so "$SR_DIR/vendor/" 2>/dev/null || true
 
-if [ -s "$SR_DIR/models/anv3.nb" ]; then
+if [ -s "$SR_DIR/models/anv3_352x224.nb" ]; then
     say "已有 NBG，跳过下载"
 else
     say "下载 NBG（$NBG_URL）"
-    curl -fL --retry 3 -o "$SR_DIR/models/anv3.nb" "$NBG_URL" \
-        || die "下载失败。也可以自己用 a733-npu 编一个，放到 $SR_DIR/models/anv3.nb"
+    curl -fL --retry 3 -o "$SR_DIR/models/anv3_352x224.nb" "$NBG_URL" \
+        || die "下载失败。也可以自己用 a733-npu 编一个，放到 $SR_DIR/models/anv3_352x224.nb"
 fi
 
 # VE 编解码那套（libvencoder 等）不在本仓库里，见 docs/RUNTIME.md

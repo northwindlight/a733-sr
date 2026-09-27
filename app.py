@@ -42,13 +42,20 @@ def _env(k, d):
 VENV_DIR = _env("SR_VENC_DIR",  os.path.join(BASE, "vendor/venc"))
 NPU_BIN  = _env("SR_SRPIPE",    os.path.join(BASE, "srpipe"))
 VIP_LIB  = _env("SR_VIP_LIB",   os.path.join(BASE, "vendor/viplite"))
-NBG      = _env("SR_NBG",       os.path.join(BASE, "models", "anv3.nb"))
+NBG      = _env("SR_NBG",       os.path.join(BASE, "models", "anv3_352x224.nb"))
 VENC_BIN = _env("SR_VENC_BIN",  os.path.join(VENV_DIR, "vencoderdemo_v2"))
 COOKIES  = _env("SR_COOKIES",   os.path.join(BASE, "bili_cookies.txt"))  # 可选，有则能下更高清
 # GPU 色彩转换开关。需要 img-bxm-dkms（/dev/dri/card1）+ libPVROCL。
 GPU_CONV = _env("SR_GPU", "1") not in ("0", "", "no", "false")
 
-TILE_W, TILE_H = 320, 180      # 必须等于 NBG 的输入形状
+# ★块形状必须等于 NBG 的输入形状，两者是【一起定】的。
+# NBG 定形状 ⇒ 每块 NPU 代价固定（实测只与块数有关，与 core 面积无关），
+# 所以整帧代价 = 块数 x 常数，能优化的只有块数。旧 320x180 的 core 是 288x148，
+# 960x540 要 4x4=16 块；352x224 的 core 是 320x192，960x540 正好 3x3=9 块。
+# 实测 960x540：NPU 492.5 -> 395.7 ms/帧，整帧 666 -> 600 ms。
+#   1280x720  25 -> 16 块 (-12%)      1920x1080  56 -> 36 块 (-12%)
+#   640x360    9 ->  4 块 (-39%)      320x180    1 ->  1 块 (反而略差，可忽略)
+TILE_W, TILE_H = 352, 224      # 必须等于 NBG 的输入形状
 SR_SCALE       = 4             # 该 NBG 是 x4
 MARGIN         = 16            # 分块防接缝的余量（实测 16 足够：边界差 2.07 -> 0.00）
 CHUNK_FRAMES   = 300           # 每个编码分段的帧数，限制临时盘占用
