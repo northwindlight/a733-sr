@@ -169,6 +169,53 @@ def run_stream(jid, cmd, on_line):
     return p.returncode, "".join(tail)
 
 
+def _monitor_srpipe(jid, path, base, total, t_start, stop):
+    """跟着 srpipe 的 stderr 走 —— 它每处理完一帧就写一行 `FRAME n`。
+
+    没有这个的话，界面在一整段（大源要几分钟到十几分钟）里只有一次进度更新，
+    看着就是卡死。开了它进度条才是真的在动。
+
+    ★节流：set_job 会落盘 jobs.json，逐帧写会变成每秒几十次小文件写。
+      所以最快 1 秒更新一次。
+    """
+    f = None
+    last = -1
+    last_t = 0.0
+    while not stop.is_set():
+        if f is None:
+            try:
+                f = open(path, errors="ignore")
+            except OSError:
+                time.sleep(0.3)
+                continue
+        line = f.readline()
+        if not line:
+            time.sleep(0.25)
+            continue
+        m = re.match(r"FRAME (\d+)", line)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if n == last:
+            continue
+        last = n
+        now = time.time()
+        if now - last_t < 1.0 and not stop.is_set():
+            continue                       # 节流，但收尾那次仍然写
+        last_t = now
+        done = min(base + n + 1, total or base + n + 1)
+        el = max(0.01, now - t_start)
+        rate = done / el
+        eta = int((total - done) / rate) if (total and rate > 0) else 0
+        set_job(jid, progress=min(89, 10 + (done / total * 80 if total else 0)),
+                frames_done=done, fps_now=round(rate, 2), eta_s=eta)
+    if f:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
 def run(cmd, jid=None, **kw):
     """跑一条命令，失败抛异常并带上 stderr 尾巴。可取消。"""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -284,7 +331,22 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         )
         if cancel_requested(jid):
             raise Cancelled()
-        p = run(["bash", "-c", cmd], jid=jid)
+        # ★这一段是整条流水线里最长的一步（大源要几分钟到十几分钟），
+        #   必须在**开跑之前**就把 stage 设对，否则界面会一直停在上一句
+        #   （上一句是"准备中"，于是看起来像卡死 —— 用户实测踩到）。
+        set_job(jid, stage=f"超分第 {idx+1} 段"
+                           f"（{n_done}~{min(n_done + chunk, total_frames or n_done + chunk)} 帧）",
+                progress=max(10, 10 + (n_done / total_frames * 80 if total_frames else 0)))
+        sr_err = os.path.join(wd, "sr.err")
+        stop_evt = threading.Event()
+        mon = threading.Thread(target=_monitor_srpipe,
+                               args=(jid, sr_err, n_done, total_frames, t_sr_start, stop_evt),
+                               daemon=True)
+        mon.start()
+        try:
+            p = run(["bash", "-c", cmd], jid=jid)
+        finally:
+            stop_evt.set()
         if p.returncode != 0:
             raise RuntimeError("超分段失败:\n" + (p.stderr or "")[-800:])
 
