@@ -144,6 +144,53 @@ Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码�
 | `SR_VENC_BIN` | `$SR_VENC_DIR/vencoderdemo_v2` | VE 编码器 demo 可执行文件 |
 | `SR_NBG` | `models/anv3.nb` | NPU 模型 |
 | `SR_COOKIES` | `bili_cookies.txt` | 哔哩哔哩 cookie（可选，**别提交**） |
+| `SR_SYS_CLIENTS` | `4` | 状态栏最多允许几条 SSE 长连接 |
+
+---
+
+## 状态栏（温度 / CPU / 内存 / NPU / GPU）
+
+页面顶部那条是实时状态，走 **SSE**（`/api/sys`）而不是轮询。
+`/api/sys.json` 是一次性快照，调试用（`curl` 一下就知道数）。
+
+采集在 **`sysmon.py` 里单独一个线程**按 1 Hz 刷新快照，HTTP 那边只读快照：
+
+- **必须单点采样**：CPU 利用率是两次 `/proc/stat` 求差。每个连接各采各的会
+  互相吃掉差值 —— 第二个标签页一开，第一个的读数就跳 0。
+- 前端**不重建 DOM**：每秒重建一次会让 hover 和文字选择一直被打断。
+  只在「顺序真的变了」时才重建行（温度会互相超车），其余原地改数值。
+
+### 温度条的量程，不是 0~100°C
+
+是**该传感器自己的首个降频阈值**。A733 的 8 个 zone 阈值差很多：
+
+| 传感器 | 首个阈值 |
+|---|---|
+| CPU 小核 / 大核 / GPU | 60 °C |
+| 板面 `skin_zone` | **50 °C** |
+| 小核 / 大核·空闲参考 | 70 / 90 °C |
+| DDR / NPU | 110 °C |
+
+所以条的长短**不能跨行直接比**：同样 50 °C，对 CPU 才 83%，对板面已经到线。
+行尾的 `/60` `/50` 就是各自的量程。数字变黄（≥85%）变红（≥95%）才是真警告。
+
+带「空闲」的是热管理用来做基准的辅助区，不是主传感器，但读数是真的。
+
+### ★GPU / NPU 硬件计数器读不到（需要 root）
+
+两个计数器都在 debugfs 里，**而 `/sys/kernel/debug` 整个目录是 `drwx------ root`**：
+
+| | 路径 |
+|---|---|
+| NPU 负载 | `/sys/kernel/debug/viplite/core_loading` → `NPU Loading ----> Core0: 0%` |
+| GPU 负载 | `/sys/kernel/debug/pvr/status` → `GPU Utilisation: 42%` + 2D/GEOM/3D/CDM 分项 |
+
+服务以普通用户跑，进不去这个目录，所以状态栏这两格显示 `—` 和原因。
+**注意不是文件本身 0600 —— 是父目录 0700，光给文件 chmod 没用。**
+NPU 的**频率**（devfreq）不需要权限，照常显示。
+
+代码把「驱动没加载」和「读不到」分开报：判据不能是 `os.path.exists(path)`
+（debugfs 进不去时它对底下任何路径都返回 False），得拿 debugfs 之外的节点当代理。
 
 ---
 
@@ -201,6 +248,7 @@ VE 编码器自带缩放，1080p→720p 免费。但**放大直接失败**
 | 路径 | 说明 |
 |---|---|
 | `app.py` | Web 服务 + 流水线（单文件，只用 Python 标准库 + numpy） |
+| `sysmon.py` | 系统状态采集（温度/CPU/内存/NPU/GPU），1 Hz 快照，SSE 推给前端 |
 | `srpipe.c` | NPU 分块超分（C，链 awnn / VIP Lite） |
 | `static/index.html` | 前端（无框架、无 CDN 依赖） |
 | `deploy/install.sh` | 一键安装 |

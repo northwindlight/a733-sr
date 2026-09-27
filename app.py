@@ -29,6 +29,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
+import sysmon
+
 # ---------------------------------------------------------------- 配置
 BASE     = os.path.dirname(os.path.abspath(__file__))
 DATA     = os.path.join(BASE, "data")          # 上传 + 产物
@@ -38,6 +40,12 @@ STATIC   = os.path.join(BASE, "static")
 
 def _env(k, d):
     return os.environ.get(k) or d
+
+# 系统状态采集：一个后台线程按 1 Hz 刷新快照，网页用 SSE 订阅。
+# ★必须单点采样：CPU 利用率是两次 /proc/stat 的差值，每个连接各采各的会互相
+#   吃掉差值（第二个标签页一开，第一个的读数就跳 0）。
+SYS = sysmon.Sampler()
+SYS_MAX_CLIENTS = int(_env("SR_SYS_CLIENTS", "4"))   # 1GB 内存的板子，别让线程炸开
 
 VENV_DIR = _env("SR_VENC_DIR",  os.path.join(BASE, "vendor/venc"))
 NPU_BIN  = _env("SR_SRPIPE",    os.path.join(BASE, "srpipe"))
@@ -528,6 +536,10 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
 
 
 # ---------------------------------------------------------------- HTTP
+_sse_lock = threading.Lock()
+_sse_n = [0]                     # 当前 SSE 连接数（用列表当可变盒子）
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "a733-sr"
 
@@ -555,12 +567,50 @@ class H(BaseHTTPRequestHandler):
         with open(path, "rb") as f:
             shutil.copyfileobj(f, self.wfile, 1 << 16)
 
+    def _sse_sys(self):
+        """SSE 推系统状态。每个连接一个线程，最多 SYS_MAX_CLIENTS 个。
+
+        内容是「变化才推」：温度每秒都在动，所以实际上就是 1 Hz。
+        用 HTTP/1.1 + Connection: close —— 响应体靠关连接定界，
+        这是 EventSource 认的合法形态（类默认是 HTTP/1.0，这里显式抬一下）。
+        """
+        with _sse_lock:
+            if _sse_n[0] >= SYS_MAX_CLIENTS:
+                return self._json({"error": "监视连接数已满(%d)" % SYS_MAX_CLIENTS}, 503)
+            _sse_n[0] += 1
+        try:
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")   # 万一前面挂了反代，别缓冲
+            self.end_headers()
+            # 先推一次：CPU 利用率要等第二个采样点才有值，先告诉前端「在等」
+            self.wfile.write(b"retry: 3000\n\n")
+            last = None
+            while True:
+                b = json.dumps(SYS.snapshot(), ensure_ascii=False)
+                if b != last:
+                    self.wfile.write(("data: " + b + "\n\n").encode())
+                    last = b
+                time.sleep(1.0)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                                   # 关页面就是关连接，正常
+        finally:
+            with _sse_lock:
+                _sse_n[0] -= 1
+
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path in ("/", "/index.html"):
             return self._file(os.path.join(STATIC, "index.html"),
                               "text/html; charset=utf-8")
+        if u.path == "/api/sys":
+            return self._sse_sys()
+        if u.path == "/api/sys.json":              # 调试/巡检用的一次性快照
+            return self._json(SYS.snapshot())
         if u.path == "/api/jobs":
             return self._json({"jobs": [dict(v, id=k) for k, v in all_jobs()][:40]})
         if u.path == "/api/status":
@@ -663,6 +713,7 @@ def sweep_stale():
 def main():
     _load()
     sweep_stale()
+    SYS.start()
     print(f"A733 视频超分服务  监听 0.0.0.0:{PORT}", flush=True)
     print(f"  NPU: {NBG}  块 {TILE_W}x{TILE_H} x{SR_SCALE} margin={MARGIN}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
