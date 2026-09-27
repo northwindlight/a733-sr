@@ -163,9 +163,9 @@ function showProgress(stage, pct){
   render();
 }
 
-function start(id){
-  cur = {id, stage:'排队', progress:1, status:'running'};
-  render();
+// ★轮询独立出来：页面重新打开时也要能接着看同一个任务
+//   （任务是服务端线程在跑，关浏览器不影响它，但浏览器这边得能重新挂上去）
+function poll(id){
   if(timer) clearInterval(timer);
   timer = setInterval(async () => {
     const j = await (await fetch('/api/status?id=' + id)).json();
@@ -173,7 +173,13 @@ function start(id){
     cur = j; render();
     if(j.status === 'done' || j.status === 'error' || j.status === 'cancelled'){
       clearInterval(timer); timer = null; }
-  }, 900);
+  }, 2000);
+}
+
+function start(id){
+  cur = {id, stage:'排队', progress:1, status:'running'};
+  render();
+  poll(id);
 }
 
 function render(){
@@ -227,8 +233,14 @@ $('#drop').addEventListener('drop', e => {
 $('#goUrl').onclick = viaUrl;
 $('#go').onclick = () => $('#file').click();
 
+// 打开页面时恢复现场：接着显示最新的那个任务，在跑就继续轮询
 fetch('/api/jobs').then(r=>r.json()).then(d=>{
-  $('#engine').textContent = '共 ' + d.jobs.length + ' 个任务';
+  const list = d.jobs || [];
+  $('#engine').textContent = '共 ' + list.length + ' 个任务（关掉网页不会中断，回来还能接着看）';
+  if(!list.length) return;
+  const j = list[0];                 // 服务端已按时间倒序
+  cur = j; render();
+  if(j.status === 'running') poll(j.id);
 }).catch(()=>{});
 </script>
 </body>
