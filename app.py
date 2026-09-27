@@ -73,6 +73,12 @@ class Cancelled(Exception):
     pass
 
 
+# ★串行闸：板子只有一个 NPU、一个编码器实例。两个任务同时跑会互相抢，
+#   各自半速 —— 不如排队跑完一个再跑下一个。README 一直是这么写的，
+#   这里把实现补上（原来是无脑起线程，并发跑）。
+_run_lock = threading.Lock()
+
+
 def request_cancel(jid):
     with _lock:
         _cancel.add(jid)
@@ -332,7 +338,12 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
                 raise RuntimeError("下载失败:\n" + tail)
             src = dst
         set_job(jid, status="running")
-        pipeline(jid, src, scale, target_h, t0, sharp)
+        if _run_lock.locked():
+            set_job(jid, stage="排队等前面的任务跑完（板子只有一个 NPU）")
+        with _run_lock:
+            if cancel_requested(jid):
+                raise Cancelled()
+            pipeline(jid, src, scale, target_h, t0, sharp)
     except Cancelled:
         set_job(jid, status="cancelled", stage="已取消", progress=100,
                 error="用户取消", took=round(time.time() - t0, 1))
@@ -381,7 +392,13 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/status":
             jid = (q.get("id") or [""])[0]
             j = get_job(jid)
-            return self._json(j or {"error": "无此任务"}, 200 if j else 404)
+            if not j:
+                return self._json({"error": "无此任务"}, 404)
+            # ★必须把 id 也放进去：id 本来是字典的 key，不在值里。
+            #   前端轮询拿到 j 之后要拿 j.id 去拼"取消"和"下载"的链接，
+            #   漏了它就变成 undefined —— 按钮看着在、点了没反应，而且不报错。
+            j["id"] = jid
+            return self._json(j)
         if u.path == "/api/download":
             jid = (q.get("id") or [""])[0]
             j = get_job(jid)
