@@ -43,6 +43,10 @@
   .tag.done{background:#12341f;color:var(--ok)}
   .tag.err{background:#3a1717;color:var(--err)}
   .tag.run{background:#12233f;color:var(--acc)}
+  .tag.cancel{background:#3a2f12;color:#e0a93b}
+  button.mini{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+              padding:3px 11px;font-size:12px;font-weight:500;border-radius:6px}
+  button.mini:hover{border-color:var(--err);color:var(--err)}
   pre.err{background:#241416;border:1px solid #4a1f22;color:#ffb3ad;padding:10px;
           border-radius:7px;font-size:12px;overflow:auto;max-height:200px;white-space:pre-wrap}
   a.dl{color:var(--ok);font-weight:600;text-decoration:none}
@@ -164,7 +168,8 @@ function start(id){
     const j = await (await fetch('/api/status?id=' + id)).json();
     if(j.error) return;
     cur = j; render();
-    if(j.status === 'done' || j.status === 'error'){ clearInterval(timer); timer = null; }
+    if(j.status === 'done' || j.status === 'error' || j.status === 'cancelled'){
+      clearInterval(timer); timer = null; }
   }, 900);
 }
 
@@ -172,11 +177,15 @@ function render(){
   const j = cur;
   if(!j) return;
   const done = j.status === 'done';
-  const cls = done ? 'done' : (j.status === 'error' ? 'err' : 'run');
+  const cls = done ? 'done'
+            : j.status === 'error' ? 'err'
+            : j.status === 'cancelled' ? 'cancel' : 'run';
   let html = `<div class="job">
     <div class="t">
       <span class="n">${esc(j.name || j.id || '')}</span>
-      <span class="tag ${cls}">${done ? '完成' : (j.status==='error'?'失败':(j.stage||''))}</span>
+      <span class="tag ${cls}">${done ? '完成'
+        : j.status==='error' ? '失败'
+        : j.status==='cancelled' ? '已取消' : (j.stage||'')}</span>
     </div>
     <div class="bar"><i style="width:${j.progress||0}%"></i></div>
     <div class="meta">
@@ -188,10 +197,17 @@ function render(){
       ${j.size ? `<span>${(j.size/1048576).toFixed(1)} MB</span>`:''}
       ${j.took ? `<span>耗时 ${j.took}s</span>`:''}
       ${done ? `<a class="dl" href="/api/download?id=${j.id||''}&name=${encodeURIComponent((j.name||'sr').replace(/\.[^.]+$/,''))}">下载</a>`:''}
+      ${(j.status==='running') ? `<button class="mini" onclick="cancelJob('${j.id||''}')">取消</button>`:''}
     </div>
     ${j.error ? `<pre class="err">${esc(j.error)}</pre>`:''}
   </div>`;
   $('#jobs').innerHTML = html;
+}
+
+async function cancelJob(id){
+  if(!id) return;
+  if(!confirm('取消这个任务？已完成的帧会丢掉。')) return;
+  await fetch('/api/cancel?id=' + id, {method:'POST'});
 }
 
 function esc(s){ return String(s).replace(/[&<>"]/g, c =>

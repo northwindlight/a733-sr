@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -59,6 +60,48 @@ os.makedirs(WORK, exist_ok=True)
 _lock = threading.Lock()
 _jobs = {}
 
+# ---------------------------------------------------------------- 取消
+# 取消要能杀掉正在跑的那一段：流水线里跑的是
+#   ffmpeg | srpipe | ffmpeg   （bash 管道）和 vencoderdemo
+# 所以起进程时要用 start_new_session 开新进程组，取消时 killpg 整组，
+# 否则只杀 bash、下游的 srpipe/ffmpeg 会变成孤儿继续吃 NPU。
+_cancel = set()
+_procs = {}
+
+
+class Cancelled(Exception):
+    pass
+
+
+def request_cancel(jid):
+    with _lock:
+        _cancel.add(jid)
+        p = _procs.get(jid)
+    if p is not None:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+
+def cancel_requested(jid):
+    with _lock:
+        return jid in _cancel
+
+
+def _register(jid, p):
+    with _lock:
+        _procs[jid] = p
+
+
+def _unregister(jid, p):
+    with _lock:
+        if _procs.get(jid) is p:
+            _procs.pop(jid, None)
+
 
 def _load():
     try:
@@ -95,13 +138,23 @@ def all_jobs():
 
 
 # ---------------------------------------------------------------- 工具
-def run(cmd, **kw):
-    """跑一条命令，失败抛异常并带上 stderr 尾巴。"""
-    p = subprocess.run(cmd, capture_output=True, text=True, **kw)
+def run(cmd, jid=None, **kw):
+    """跑一条命令，失败抛异常并带上 stderr 尾巴。可取消。"""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, start_new_session=True, **kw)
+    if jid:
+        _register(jid, p)
+    try:
+        out, err = p.communicate()
+    finally:
+        if jid:
+            _unregister(jid, p)
+    if jid and cancel_requested(jid):
+        raise Cancelled()
     if p.returncode != 0:
-        tail = "\n".join((p.stderr or p.stdout or "").strip().split("\n")[-12:])
+        tail = "\n".join((err or out or "").strip().split("\n")[-12:])
         raise RuntimeError(f"命令失败({p.returncode}): {' '.join(cmd[:3])}...\n{tail}")
-    return p
+    return subprocess.CompletedProcess(cmd, 0, out, err)
 
 
 def probe(path):
@@ -191,7 +244,9 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             f'| ffmpeg -v error -nostdin -f rawvideo -pix_fmt gbrp -s {out_w}x{out_h} -i - '
             f'-vf "scale={final_w}:{final_h}{fin}" -pix_fmt nv12 -f rawvideo -y {shq(nv12)}'
         )
-        p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        if cancel_requested(jid):
+            raise Cancelled()
+        p = run(["bash", "-c", cmd], jid=jid)
         if p.returncode != 0:
             raise RuntimeError("超分/缩放段失败:\n" + (p.stderr or "")[-800:])
 
@@ -206,7 +261,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         set_job(jid, stage=f"硬件编码 第{idx+1}段")
         run(["bash", "-c",
              f'LD_LIBRARY_PATH={VENV_DIR} {shq(VENC_BIN)} -i {shq(nv12)} '
-             f'-n {got} -f 0 -o {shq(seg)} -s {final_w}x{final_h} -d {final_w}x{final_h}'])
+             f'-n {got} -f 0 -o {shq(seg)} -s {final_w}x{final_h} -d {final_w}x{final_h}'],
+            jid=jid)
 
         os.remove(nv12)
         parts.append(seg)
@@ -238,7 +294,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     else:
         cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -i {shq(listf)} '
                f'-c:v copy -y {shq(out)}')
-    run(["bash", "-c", cmd])
+    run(["bash", "-c", cmd], jid=jid)
 
     shutil.rmtree(wd, ignore_errors=True)
     size = os.path.getsize(out)
@@ -264,13 +320,17 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
             if os.path.exists(COOKIES):
                 cmd += ["--cookies", COOKIES]
             cmd.append(url)
-            p = subprocess.run(cmd, capture_output=True, text=True)
+            p = run(cmd, jid=jid)
             if p.returncode != 0 or not os.path.exists(dst):
                 tail = "\n".join((p.stderr or p.stdout or "").strip().split("\n")[-8:])
                 raise RuntimeError("下载失败:\n" + tail)
             src = dst
         set_job(jid, status="running")
         pipeline(jid, src, scale, target_h, t0, sharp)
+    except Cancelled:
+        set_job(jid, status="cancelled", stage="已取消", progress=100,
+                error="用户取消", took=round(time.time() - t0, 1))
+        shutil.rmtree(os.path.join(WORK, jid), ignore_errors=True)
     except Exception as e:
         set_job(jid, status="error", stage="失败", error=str(e)[:1500],
                 progress=100, detail=traceback.format_exc()[-1500:])
@@ -356,6 +416,17 @@ class H(BaseHTTPRequestHandler):
             threading.Thread(target=worker, args=(jid, dst, scale, th, None, sh),
                              daemon=True).start()
             return self._json({"id": jid})
+
+        if u.path == "/api/cancel":
+            jid = (q.get("id") or [""])[0]
+            j = get_job(jid)
+            if not j:
+                return self._json({"error": "无此任务"}, 404)
+            if j.get("status") in ("done", "error", "cancelled"):
+                return self._json({"ok": True, "note": "已经结束了"})
+            request_cancel(jid)
+            set_job(jid, stage="正在取消…")
+            return self._json({"ok": True})
 
         if u.path == "/api/url":
             ln = int(self.headers.get("Content-Length") or 0)
