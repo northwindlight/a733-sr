@@ -19,7 +19,15 @@
  *   640x360 源无 margin 是 2x2=4 块，margin=16 是 3x3=9 块，总处理像素都是 518K。
  *
  * 用法：
- *   srpipe <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h> [--margin M]
+ *   srpipe <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h>
+ *          [--margin M] [--nv12] [--sharpen A]
+ *
+ * 默认输出平面 RGB（gbrp），配 ffmpeg 用。
+ * ★--nv12 直接吐 NV12（Y 平面 + 交织 CbCr，2x2 下采样），为了喂 VE 硬编：
+ *   ① 数据量从 3 字节/像素降到 1.5，管道/磁盘都省一半
+ *   ② 省掉 ffmpeg 那一步 swscale —— 实测它在大尺寸上是整条流水线的瓶颈
+ *      （5120x2880 时 ffmpeg 占 368% CPU，srpipe 才 45%）
+ *   ③ 编码器原生就吃 NV12，可以再用 FIFO 把中间文件也省掉
  *
  *   输入 stdin ：每帧 in_w*in_h*3 字节，平面排列 R 面|G 面|B 面（= ffmpeg gbrp）
  *   输出 stdout：每帧 (in_w*scale)*(in_h*scale)*3 字节，同样平面排列
@@ -67,9 +75,14 @@ int main(int argc, char **argv)
     const char *nbg = argv[1];
     int iw = atoi(argv[2]), ih = atoi(argv[3]), scale = atoi(argv[4]);
     int tw = atoi(argv[5]), th = atoi(argv[6]);
-    int margin = 0;
-    for (int i = 7; i < argc; i++)
+    int margin = 0, out_nv12 = 0;
+    float sharpen = 0.0f;
+    for (int i = 7; i < argc; i++) {
         if (!strcmp(argv[i], "--margin") && i + 1 < argc) margin = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--nv12")) out_nv12 = 1;
+        else if (!strcmp(argv[i], "--sharpen") && i + 1 < argc) sharpen = (float)atof(argv[++i]);
+    }
+    if (sharpen < 0.0f) sharpen = 0.0f;
     if (iw <= 0 || ih <= 0 || scale <= 0 || tw <= 0 || th <= 0) die("参数不合法");
     if (margin < 0) margin = 0;
     if (2 * margin >= tw || 2 * margin >= th) die("margin 太大了");
@@ -89,12 +102,15 @@ int main(int argc, char **argv)
             iw, ih, ow, oh, tw, th, margin, cw, ch, nx, ny, nx * ny);
 
     const size_t frame_in  = (size_t)iw * ih * 3;
-    const size_t frame_out = (size_t)ow * oh * 3;
+    const size_t frame_out = out_nv12 ? (size_t)ow * oh * 3 / 2     /* NV12 = Y + 交织 CbCr(1/2) */
+                                      : (size_t)ow * oh * 3;
+    const size_t rgb_bytes = (size_t)ow * oh * 3;   /* 组帧始终是平面 RGB */
     const size_t tile_in   = (size_t)tw * th * 3;
     const size_t tile_out  = (size_t)stw * sth * 3;
 
     unsigned char *fin   = (unsigned char *)malloc(frame_in);
-    unsigned char *fout  = (unsigned char *)malloc(frame_out);
+    unsigned char *fout  = (unsigned char *)malloc(rgb_bytes);   /* 平面 RGB 整帧 */
+    unsigned char *yuv   = out_nv12 ? (unsigned char *)malloc(frame_out) : NULL;
     unsigned char *tin   = (unsigned char *)malloc(tile_in);
     unsigned char *tout  = (unsigned char *)malloc(tile_out);
     if (!fin || !fout || !tin || !tout) die("malloc 失败");
@@ -157,7 +173,84 @@ int main(int argc, char **argv)
             }
         }
 
-        write_full(data_fd, fout, frame_out);
+        if (out_nv12) {
+            /* 整帧平面 -> NV12（BT.601 有限范围，16..235 / 128 中心）。
+             *
+             * ★平面顺序是 G, B, R —— 不是 R, G, B！
+             * 这是从数据里回归出来的：拿 ffmpeg 的 gbrp->nv12 当参考做最小二乘，
+             * 拟合系数正好是 BT.601 的系数按 (R,G,B)->(G,B,R) 置换。
+             * 也正因为 NPU 的输出顺序恰好就是 gbrp 的定义，整条流水线才对得上。
+             * 之前按 R,G,B 读，往返误差 7.18；改对之后应降到 <1。
+             *
+             * 色度 2x2 平均必须在整帧而不是每块里做 —— 2x2 块会跨块边界。 */
+            const unsigned char *G = fout, *B = fout + (size_t)ow * oh,
+                                *R = fout + (size_t)2 * ow * oh;
+            unsigned char *Yp = yuv, *UV = yuv + (size_t)ow * oh;
+            for (int y = 0; y < oh; y++) {
+                unsigned char *yp = Yp + (size_t)y * ow;
+                const unsigned char *rp = R + (size_t)y * ow,
+                                    *gp = G + (size_t)y * ow,
+                                    *bp = B + (size_t)y * ow;
+                for (int x = 0; x < ow; x++) {
+                    int r = rp[x], g = gp[x], b = bp[x];
+                    /* BT.601 limited: 0.2568/0.5041/0.0979, 16..235 */
+                    int v = ((16829 * r + 33039 * g + 6416 * b) >> 16) + 16;
+                    if (v < 16) v = 16; else if (v > 235) v = 235;
+                    yp[x] = (unsigned char)v;
+                }
+            }
+            for (int y = 0; y < oh; y += 2) {
+                unsigned char *uvp = UV + (size_t)(y / 2) * ow;
+                for (int x = 0; x < ow; x += 2) {
+                    int sr = 0, sg = 0, sb = 0;
+                    for (int dy = 0; dy < 2; dy++) {
+                        int yy = y + dy; if (yy >= oh) yy = oh - 1;
+                        const unsigned char *rp = R + (size_t)yy * ow,
+                                            *gp = G + (size_t)yy * ow,
+                                            *bp = B + (size_t)yy * ow;
+                        for (int dx = 0; dx < 2; dx++) {
+                            int xx = x + dx; if (xx >= ow) xx = ow - 1;
+                            sr += rp[xx]; sg += gp[xx]; sb += bp[xx];
+                        }
+                    }
+                    int r = sr >> 2, g = sg >> 2, b = sb >> 2;
+                    /* BT.601 limited 色差: -0.1482/-0.2914/+0.4392 与 +0.4392/-0.3678/-0.0714 */
+                    int cb = ((-9711 * r - 19098 * g + 28784 * b) >> 16) + 128;
+                    int cr = (( 28784 * r - 24103 * g - 4681 * b) >> 16) + 128;
+                    if (cb < 16) cb = 16; else if (cb > 240) cb = 240;
+                    if (cr < 16) cr = 16; else if (cr > 240) cr = 240;
+                    uvp[x]     = (unsigned char)cb;
+                    uvp[x + 1] = (unsigned char)cr;
+                }
+            }
+            /* 亮度锐化（3x3 unsharp）。放在这里而不是用 ffmpeg 的 cas：
+             * 新流水线里 ffmpeg 已经不参与后期了（缩放交给 VE），
+             * 而把一整帧再交给 ffmpeg 只为锐化不划算。
+             * 边缘一圈不处理 —— 省掉边界钳制，且边界本来也不该被锐化。 */
+            if (sharpen > 0.0f) {
+                unsigned char *tmp = (unsigned char *)malloc((size_t)ow * oh);
+                if (tmp) {
+                    memcpy(tmp, Yp, (size_t)ow * oh);
+                    int a = (int)(sharpen * 256.0f + 0.5f);
+                    for (int y = 1; y < oh - 1; y++) {
+                        unsigned char *yp = Yp + (size_t)y * ow;
+                        const unsigned char *tp = tmp + (size_t)y * ow;
+                        for (int x = 1; x < ow - 1; x++) {
+                            int s9 = tp[x-ow-1] + tp[x-ow] + tp[x-ow+1]
+                                   + tp[x-1]    + tp[x]    + tp[x+1]
+                                   + tp[x+ow-1] + tp[x+ow] + tp[x+ow+1];
+                            int v = tp[x] + (((tp[x] - s9 / 9) * a) >> 8);
+                            if (v < 16) v = 16; else if (v > 235) v = 235;
+                            yp[x] = (unsigned char)v;
+                        }
+                    }
+                    free(tmp);
+                }
+            }
+            write_full(data_fd, yuv, frame_out);
+        } else {
+            write_full(data_fd, fout, rgb_bytes);
+        }
         fprintf(stderr, "FRAME %ld\n", frame);
         frame++;
     }

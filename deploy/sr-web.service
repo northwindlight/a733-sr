@@ -1,7 +1,6 @@
 [Unit]
 Description=A733 视频超分 Web 服务
 After=network.target
-# VE/NPU 设备就绪后再起
 After=systemd-udev-settle.service
 
 [Service]
@@ -9,12 +8,17 @@ Type=simple
 User=northwind
 Group=northwind
 WorkingDirectory=/opt/sr
+
+# ★ 这几个必须给，否则 app.py 会退回 BASE/vendor/venc 这类默认值然后 exit 127。
+#   install.sh 会按实际位置覆盖；手工部署时务必对一遍。
 Environment=SR_PORT=8080
+Environment=SR_VENC_DIR=/home/northwind/venc2
+Environment=SR_VIP_LIB=/home/northwind/ai-sdk/viplite-tina/lib/aarch64-none-linux-gnu/v2.0
 Environment=PYTHONUNBUFFERED=1
+
 ExecStart=/usr/bin/python3 /opt/sr/app.py
 Restart=on-failure
 RestartSec=3
-# 任务产物放在 /opt/sr/data，允许写
 ReadWritePaths=/opt/sr
 
 [Install]

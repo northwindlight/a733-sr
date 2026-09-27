@@ -108,11 +108,11 @@ sed -e "s|/opt/sr|$SR_DIR|g" -e "s|^User=.*|User=$RUN_USER|" \
     -e "s|SR_VENC_DIR=.*||" \
     "$REPO/deploy/sr-web.service" > /etc/systemd/system/sr-web.service
 
-# 把编码器路径写进服务（本仓库不含那套库，只能指到用户自己编的地方）
-if [ -x "$VENC_DIR/vencoderdemo_v2" ]; then
-    sed -i "s|^Environment=SR_PORT=8080|Environment=SR_PORT=${SR_PORT:-8080}\nEnvironment=SR_VENC_DIR=$VENC_DIR\nEnvironment=SR_VIP_LIB=$SR_DIR/vendor|" \
-        /etc/systemd/system/sr-web.service
-fi
+# 把编码器/VIP 库的实际路径写进服务（本仓库不含那两套库，只能指到用户自己的位置）
+sed -i -e "s|^Environment=SR_VENC_DIR=.*|Environment=SR_VENC_DIR=$VENC_DIR|" \
+       -e "s|^Environment=SR_VIP_LIB=.*|Environment=SR_VIP_LIB=$SR_DIR/vendor|" \
+       -e "s|^Environment=SR_PORT=.*|Environment=SR_PORT=${SR_PORT:-8080}|" \
+    /etc/systemd/system/sr-web.service
 
 install -m644 "$REPO/deploy/Caddyfile" /etc/caddy/Caddyfile
 caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 || \

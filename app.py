@@ -214,6 +214,11 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     tiles_y = -(-H // (TILE_H - 2 * MARGIN))
     npu_ms = W * H * 0.547 / 1000.0            # 实测 0.547 µs/源像素
 
+    # 中间文件是 SR 分辨率（源×4）的 NV12 —— 720p 源就是 22 MB/帧。
+    # 分段大小按它定，把临时盘控在 ~2 GB 以内（原来是按目标尺寸算的，会超）。
+    bytes_per_frame = out_w * out_h * 3 // 2
+    chunk = max(10, min(CHUNK_FRAMES, int(2e9 / max(1, bytes_per_frame))))
+
     total_frames = meta["nb_frames"] or int(meta["duration"] * fps)
     est = npu_ms * total_frames / 1000.0 if total_frames else 0
     set_job(jid, stage="准备中", meta={
@@ -232,36 +237,37 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         seg = os.path.join(wd, f"seg{idx}.h264")
         nv12 = os.path.join(wd, f"seg{idx}.nv12")
 
-        # ★CAS（对比度自适应锐化）而不是 unsharp：unsharp 在平坦区过度锐化会出晕，
-        #   CAS 按局部对比度决定强度，正是"模型把边缘糊了"这个场景要的。
-        #   实测拉普拉斯均值 2.42 -> 3.37（strength 0.6），且不动平坦区。
-        fin = f",cas=strength={sharp}" if sharp and sharp > 0 else ""
+        # srpipe 直接吐 NV12（源×4 分辨率），缩放交给 VE 编码器 —— VE 自带缩放，白送。
+        # 这样省掉原来那一步 ffmpeg swscale：实测它是整条流水线的瓶颈
+        # （5120x2880 时 ffmpeg 占 368% CPU，srpipe 才 45%）。
+        # 数据量也砍半：gbrp 3 字节/像素 -> NV12 1.5。
+        # 锐化改由 srpipe 自己做（新路径里 ffmpeg 不参与后期了，不能让开关静默失效）。
+        sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
         cmd = (
             f'ffmpeg -v error -nostdin -ss {n_done / fps:.6f} -i {shq(src)} '
-            f'-frames:v {CHUNK_FRAMES} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
+            f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
             f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
-            f'{TILE_W} {TILE_H} --margin {MARGIN} 2> {shq(wd + "/sr.err")} '
-            f'| ffmpeg -v error -nostdin -f rawvideo -pix_fmt gbrp -s {out_w}x{out_h} -i - '
-            f'-vf "scale={final_w}:{final_h}{fin}" -pix_fmt nv12 -f rawvideo -y {shq(nv12)}'
+            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg} '
+            f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
         )
         if cancel_requested(jid):
             raise Cancelled()
         p = run(["bash", "-c", cmd], jid=jid)
         if p.returncode != 0:
-            raise RuntimeError("超分/缩放段失败:\n" + (p.stderr or "")[-800:])
+            raise RuntimeError("超分段失败:\n" + (p.stderr or "")[-800:])
 
         if not os.path.exists(nv12) or os.path.getsize(nv12) < 1024:
             break                                    # 没有更多帧了
 
-        got = os.path.getsize(nv12) // (final_w * final_h * 3 // 2)
+        got = os.path.getsize(nv12) // (out_w * out_h * 3 // 2)   # 中间是 SR 分辨率
         if got == 0:
             break
 
-        # 用 VE 硬编这一段
+        # VE 硬编这一段：-s 给 SR 尺寸、-d 给目标尺寸 —— 缩放由 VE 做
         set_job(jid, stage=f"硬件编码 第{idx+1}段")
         run(["bash", "-c",
              f'LD_LIBRARY_PATH={VENV_DIR} {shq(VENC_BIN)} -i {shq(nv12)} '
-             f'-n {got} -f 0 -o {shq(seg)} -s {final_w}x{final_h} -d {final_w}x{final_h}'],
+             f'-n {got} -f 0 -o {shq(seg)} -s {out_w}x{out_h} -d {final_w}x{final_h}'],
             jid=jid)
 
         os.remove(nv12)
@@ -273,7 +279,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                 stage=f"超分+编码 {n_done}/{total_frames or '?'} 帧")
         idx += 1
 
-        if got < CHUNK_FRAMES:
+        if got < chunk:
             break                                    # 源已经放完
 
     if not parts:
