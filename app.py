@@ -489,27 +489,27 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             #   实测每帧 5.1ms CPU）。现在 srpipe 自己带 --in-h 裁。
             # ★顺序读，不 seek —— 管道里是连续的帧，seek 不了也不需要。
             head = (
-                f'LD_LIBRARY_PATH={VIP_LIB} {PIN}{shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
+                f'LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12 --in-nv12 --in-h {ah} '
                 f'--frames {chunk}{sh_arg}{gpu_arg} '
                 f'2> {shq(wd + "/sr.err")}'
             )
         else:
             # 软解路径：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面，喂给 srpipe
-            # ★这里刻意【不】钉解码那级 ffmpeg：它是多线程的，钉到 2 个大核反而更慢。
-            #   只钉 srpipe（单线程）和后面那级缩放。
+            # ★解码那级 ffmpeg 也是多线程的，同样钉大核 —— 见 _pick_cpus 里那段：
+            #   大小核上"多线程就让它用全部核"是错的，小核会拖着整批。
             head = (
                 f'ffmpeg -v error -nostdin '
                 f'-ss {n_done / fps:.6f} -i {shq(src)} '
                 f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
-                f'| LD_LIBRARY_PATH={VIP_LIB} {PIN}{shq(NPU_BIN)} {shq(NBG)} '
+                f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} '
                 f'{W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
                 f'2> {shq(wd + "/sr.err")}'
             )
         # 两条路都在这里收口：SR 出来是源×4，如果不是目标尺寸，就在管道里缩一次。
         if ds:
-            cmd = (f'set -o pipefail; {head} | {PIN}ffmpeg -v error -nostdin -f rawvideo '
+            cmd = (f'set -o pipefail; {head} | ffmpeg -v error -nostdin -f rawvideo '
                    f'-pix_fmt nv12 -s {out_w}x{out_h} -i - '
                    f'-vf scale={final_w}:{final_h}:flags=area -f rawvideo -pix_fmt nv12 '
                    f'-y {shq(nv12)}')
@@ -660,6 +660,12 @@ def _pick_cpus():
     实测（2026-09-28）不钉的时候 srpipe 在 7/4/3/3/3/3/4/6/4 之间乱跳 ——
     单线程的活被调度器摊到空闲的小核上去了，大核空着。
 
+    ★多线程的活也要钉，别以为"核多就是好"。大小核上把 N 个线程摊到 6小+2大，
+      整批是被**最慢的那条**拖着的（小核那条要 2.66 倍时间），而 ffmpeg 这类
+      按 mask 里的核数开线程的程序，锁大核等于每条线程都快 2.66 倍 ——
+      **全核反而比只锁大核更慢**（用户 2026-09-28 指出的，我原来那条"多线程
+      钉 2 核会变慢"的理由是反的）。
+
     返回 None 表示不限制。可用 SR_CPUSET 覆盖（"6,7"，或 0/off 关掉）。
     """
     env = os.environ.get("SR_CPUSET")
@@ -687,13 +693,25 @@ def _pick_cpus():
 
 
 CPUS = _pick_cpus()
-if CPUS and not shutil.which("taskset"):
-    print("警告: 没有 taskset（util-linux），不做钉核", flush=True)
-    CPUS = None
-# 命令行前缀：'taskset -c 6,7 '。不限制时是空串。
-# 用 taskset 而不是 subprocess 的 preexec_fn —— 本服务是多线程的，
-# preexec_fn 在 fork 和线程之间不安全。
-PIN = f'taskset -c {",".join(map(str, CPUS))} ' if CPUS else ""
+
+
+def pin_me():
+    """把本线程钉到 CPUS 上。★在 main() 里**最先**调用一次就够：
+
+    sched_setaffinity(0, ...) 设的是**调用线程**的掩码，但之后新建的线程和
+    子进程都继承它 —— 所以服务自己、HTTP/采样线程、以及它 spawn 的
+    srpipe / ffmpeg / vencoderdemo / yt-dlp 全都会落在大核上。
+
+    先前我用的是给每条命令加 `taskset` 前缀，还特意**不钉**软解那级解码 ffmpeg
+    （理由是"它多线程，钉 2 个核更慢"）—— 那条理由是错的，见 _pick_cpus 里的说明。
+    现在统一成一处设置，多线程的活也一起钉。
+    """
+    if not CPUS:
+        return
+    try:
+        os.sched_setaffinity(0, set(CPUS))
+    except OSError as e:
+        print(f"警告: 钉核失败（{e}），按不限制跑", flush=True)
 
 
 def shq(s):
@@ -978,6 +996,7 @@ def _files(jid, kind):
 
 
 def main():
+    pin_me()                       # ★必须在起任何线程/子进程之前
     _load()
     sweep_stale()
     sweep_old()
