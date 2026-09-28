@@ -489,24 +489,27 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             #   实测每帧 5.1ms CPU）。现在 srpipe 自己带 --in-h 裁。
             # ★顺序读，不 seek —— 管道里是连续的帧，seek 不了也不需要。
             head = (
-                f'LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
+                f'LD_LIBRARY_PATH={VIP_LIB} {PIN}{shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12 --in-nv12 --in-h {ah} '
                 f'--frames {chunk}{sh_arg}{gpu_arg} '
                 f'2> {shq(wd + "/sr.err")}'
             )
         else:
             # 软解路径：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面，喂给 srpipe
+            # ★这里刻意【不】钉解码那级 ffmpeg：它是多线程的，钉到 2 个大核反而更慢。
+            #   只钉 srpipe（单线程）和后面那级缩放。
             head = (
                 f'ffmpeg -v error -nostdin '
                 f'-ss {n_done / fps:.6f} -i {shq(src)} '
                 f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
-                f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
+                f'| LD_LIBRARY_PATH={VIP_LIB} {PIN}{shq(NPU_BIN)} {shq(NBG)} '
+                f'{W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
                 f'2> {shq(wd + "/sr.err")}'
             )
         # 两条路都在这里收口：SR 出来是源×4，如果不是目标尺寸，就在管道里缩一次。
         if ds:
-            cmd = (f'set -o pipefail; {head} | ffmpeg -v error -nostdin -f rawvideo '
+            cmd = (f'set -o pipefail; {head} | {PIN}ffmpeg -v error -nostdin -f rawvideo '
                    f'-pix_fmt nv12 -s {out_w}x{out_h} -i - '
                    f'-vf scale={final_w}:{final_h}:flags=area -f rawvideo -pix_fmt nv12 '
                    f'-y {shq(nv12)}')
@@ -646,6 +649,48 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             out=os.path.basename(out), size=size,
             took=round(time.time() - t_start, 1),
             fps_done=round(n_done / max(0.01, time.time() - t_start), 2))
+
+
+def _pick_cpus():
+    """默认把重活钉在 capacity 最大的那组核上。
+
+    A733 是 6×A55(cap 385) + 2×A76(cap 1024) —— 单核容量差 **2.66 倍**。
+    小核不是"省电"：同一份活在小核上要跑 2.66 倍的时间，做完更晚、回 idle 更晚，
+    对"跑完就等 NPU"这种突发型负载是**又慢又费**。
+    实测（2026-09-28）不钉的时候 srpipe 在 7/4/3/3/3/3/4/6/4 之间乱跳 ——
+    单线程的活被调度器摊到空闲的小核上去了，大核空着。
+
+    返回 None 表示不限制。可用 SR_CPUSET 覆盖（"6,7"，或 0/off 关掉）。
+    """
+    env = os.environ.get("SR_CPUSET")
+    if env is not None:
+        env = env.strip()
+        if env in ("", "0", "off", "no", "false"):
+            return None
+        try:
+            return sorted({int(x) for x in env.replace(" ", ",").split(",") if x})
+        except ValueError:
+            return None
+    caps = {}
+    for d in os.listdir("/sys/devices/system/cpu"):
+        if d.startswith("cpu") and d[3:].isdigit():
+            try:
+                with open(f"/sys/devices/system/cpu/{d}/cpu_capacity") as f:
+                    caps[int(d[3:])] = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+    if not caps:
+        return None
+    big = sorted(c for c, v in caps.items() if v == max(caps.values()))
+    # 全都一样 = 同构机器，钉了没意义（钉到全部核 = 空操作，但别写进命令行里）
+    return big if len(big) < len(caps) else None
+
+
+CPUS = _pick_cpus()
+# 命令行前缀：'taskset -c 6,7 '。不限制时是空串。
+# 用 taskset 而不是 subprocess 的 preexec_fn —— 本服务是多线程的，
+# preexec_fn 在 fork 和线程之间不安全。
+PIN = f'taskset -c {",".join(map(str, CPUS))} ' if CPUS else ""
 
 
 def shq(s):
@@ -936,6 +981,8 @@ def main():
     SYS.start()
     print(f"A733 视频超分服务  监听 0.0.0.0:{PORT}", flush=True)
     print(f"  NPU: {NBG}  块 {TILE_W}x{TILE_H} x{SR_SCALE} margin={MARGIN}", flush=True)
+    print(f"  重活钉核: {('cpu ' + ','.join(map(str, CPUS))) if CPUS else '不限制（SR_CPUSET=0 可关）'}",
+          flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
 
