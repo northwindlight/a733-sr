@@ -65,7 +65,7 @@ GPU_CONV = _env("SR_GPU", "1") not in ("0", "", "no", "false")
 #     H264DecoderInit 里段错误（见 deploy/ve-decode/README.md）。
 VE_DECODE = _env("SR_VE_DECODE", "1") not in ("0", "", "no", "false")
 VDEC_BIN  = _env("SR_VDEC_BIN",  os.path.join(BASE, "vdecpipe"))
-VE_MAX_INTERMEDIATE = int(_env("SR_VE_MAX_GB", "20")) << 30
+VE_MAX_INTERMEDIATE = int(_env("SR_VE_MAX_GB", "20")) << 30   # 流式改造后已不用（见 sweep_old）
 
 # ★块形状必须等于 NBG 的输入形状，两者是【一起定】的。
 # NBG 定形状 ⇒ 每块 NPU 代价固定（实测只与块数有关，与 core 面积无关），
@@ -129,6 +129,34 @@ def cancel_requested(jid):
 def _register(jid, p):
     with _lock:
         _procs[jid] = p
+
+
+# 流式 VE 解码器：一个进程全程活着给管道喂数据，跨段存在，所以不能走 _procs
+# （那里一条任务只放得下一个进程，段里还要放 srpipe）。单独一张表，谁都能收。
+_ve_procs = {}
+
+
+def _ve_kill(jid):
+    """收掉解码器。正常结束、出错、取消三条路都要走它 —— 漏一条它就挂在管道上
+    不走，而且一直占着 VE 硬件，下一个任务会莫名其妙地慢。"""
+    with _lock:
+        it = _ve_procs.pop(jid, None)
+    if not it:
+        return
+    dec, raws = it
+    try:
+        if dec.stdout:
+            dec.stdout.close()
+    except Exception:
+        pass
+    try:
+        dec.terminate()
+        dec.wait(timeout=5)
+    except Exception:
+        try: dec.kill()
+        except Exception: pass
+    try: os.remove(raws)
+    except OSError: pass
 
 
 def _unregister(jid, p):
@@ -335,58 +363,39 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         "frames": total_frames, "est_npu_s": round(est, 1),
     })
 
-    # ---------- 可选：VE 硬解预处理（整片 → NV12 裸流）----------
-    nv12_src = None                       # (文件, 对齐后的高)；None = 走软解
+    # ---------- 可选：VE 硬解（流式，全程与超分并行）----------
+    # 解码器【一个进程全程活着】往管道里吐 NV12，每一段让 srpipe 读够 chunk 帧就退出，
+    # 剩下的字节留在管道里给下一段。
+    # 以前不是这样的：解码器先把整片写成 NV12 文件再审，那有三个毛病 ——
+    #   ① 有容量闸（超 20G/剩余空间 40% 就退回软解）⇒ 1080p 长片根本用不上硬解
+    #   ② 开局要空等几分钟，界面完全没进度
+    #   ③ 半截 dump 能一路混过去，静默交半个视频
+    # 解码（122fps）远快于超分（~1.5fps），所以管道永远不会饿着 NPU；
+    # 流式省不掉 NPU 的时间，省掉的是上面那三件。
+    ah = (H + 15) // 16 * 16              # ★解码器输出的高按 16 对齐（960x540 -> 960x544）
+    ve = None                             # (解码进程, 裸流路径)；None = 走软解
     if VE_DECODE and meta.get("codec") == "h264" and os.path.exists(VDEC_BIN):
-        ah = (H + 15) // 16 * 16          # ★解码器输出的高按 16 对齐（960x540 -> 960x544）
-        need = W * ah * 3 // 2 * max(1, total_frames)
-        free = shutil.disk_usage(WORK).free
-        if need >= min(VE_MAX_INTERMEDIATE, free * 4 // 10):
-            set_job(jid, stage=f"源太大，NV12 中间文件要 {need/2**30:.1f}G —— 退回软解")
-        else:
-            raws = os.path.join(wd, "src.h264")
-            dump = os.path.join(wd, "src.nv12")
-            set_job(jid, stage="VE 硬解中（专用硅解码，这段 CPU 不参与）", progress=6)
-            # ① 抽裸流：解码器只吃 elementary stream，不吃 mp4 容器
-            run(["bash", "-c", f'ffmpeg -v error -nostdin -y -i {shq(src)} '
-                               f'-c:v copy -bsf:v h264_mp4toannexb -f h264 {shq(raws)}'], jid=jid)
-            # ② 硬解整片 → NV12。★-ss 0 -sn N 必须给：demo 默认「一帧都不存且不报错」
-            n = max(1, total_frames) + 8
-            # ★这一段对长片要跑几分钟到十几分钟（受 eMMC 写入限速），而且它是
-            #   一个不可中断的子进程 —— 不给进度的话界面就冻在 6%，看着像卡死
-            #   （用户实测反馈"卡了半天"）。demo 自己不报进度，就盯输出文件大小。
-            ve_exp = W * ah * 3 // 2 * max(1, total_frames)
-            ve_stop = threading.Event()
-
-            def _ve_tick():
-                while not ve_stop.wait(3.0):
-                    try:
-                        g = os.path.getsize(dump) // (W * ah * 3 // 2)
-                    except OSError:
-                        continue
-                    set_job(jid, stage=f"VE 硬解中 {g}/{total_frames} 帧"
-                                       f"（专用硅解码，这段 CPU 不参与）",
-                            progress=min(9, 5 + 4 * os.path.getsize(dump) / max(1, ve_exp)))
-
-            ve_th = threading.Thread(target=_ve_tick, daemon=True)
-            ve_th.start()
-            run(["bash", "-c", f'LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu {shq(VDEC_BIN)} '
-                               f'-i {shq(raws)} -codFmat 1 -o {shq(dump)} -outFmat 6 '
-                               f'-n {n} -ss 0 -sn {n}'], jid=jid)
-            ve_stop.set()
-            # ★必须按【整片】验，不能只验「≥1 帧」。硬解半路停掉（磁盘满/驱动抽风）
-            #   会留下一个能用的短文件，后面每段都"正常"跑完，最后静默交半个视频。
-            fsz = W * ah * 3 // 2
-            got_f = os.path.getsize(dump) // fsz
-            if os.path.getsize(dump) >= fsz * max(1, total_frames) * 98 // 100:
-                nv12_src = (dump, ah)
-            elif got_f >= 1:
-                set_job(jid, stage=f"硬解只出了 {got_f}/{total_frames} 帧，退回软解")
-            else:
-                set_job(jid, stage="硬解没出东西，退回软解")
-            for f in (raws, dump) if not nv12_src else (raws,):
-                try: os.remove(f)
-                except OSError: pass
+        raws = os.path.join(wd, "src.h264")
+        declog = os.path.join(wd, "vdec.log")
+        set_job(jid, stage="抽裸流", progress=5)
+        # 解码器只吃 elementary stream，不吃 mp4 容器
+        run(["bash", "-c", f'ffmpeg -v error -nostdin -y -i {shq(src)} '
+                           f'-c:v copy -bsf:v h264_mp4toannexb -f h264 {shq(raws)}'], jid=jid)
+        # ★数据走 fd3、日志走 fd1。这个 demo 的日志是裸 printf，全在 stdout 上，
+        #   直接 `-o /dev/stdout` 会把日志插进 NV12 流里（实测 21 处），
+        #   于是流被垫歪、后面的帧全部错位 —— 而且大小看着还挺像整数帧。
+        # ★-ss 0 -sn N 也必须给：demo 默认「一帧都不存且不报错」。
+        n = max(1, total_frames) + 8
+        dec = subprocess.Popen(
+            ["bash", "-c",
+             f'exec 3>&1; exec env LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu '
+             f'{shq(VDEC_BIN)} -i {shq(raws)} -codFmat 1 -o /dev/fd/3 -outFmat 6 '
+             f'-n {n} -ss 0 -sn {n} 1> {shq(declog)}'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        ve = (dec, raws)
+        with _lock:
+            _ve_procs[jid] = ve
+        set_job(jid, stage="VE 硬解已接上（边解边超分）", progress=6)
 
     # ---------- 分段处理 ----------
     t_sr_start = time.time()
@@ -407,25 +416,27 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
         gpu_arg = " --gpu" if GPU_CONV else ""
-        if nv12_src:
-            # VE 硬解路径：输入已是 NV12 裸流 ⇒ 只 seek + crop，不解码、不 swscale。
-            # 管道数据量也从 gbrp 的 3 字节/像素降到 NV12 的 1.5。
-            dump, ah = nv12_src
-            inarg = (f'-f rawvideo -pix_fmt nv12 -s {W}x{ah} '
-                     f'-ss {n_done / fps:.6f} -i {shq(dump)} -frames:v {chunk} '
-                     f'-vf crop={W}:{H}:0:0 -f rawvideo -')   # ★必须显式 :0:0 —— crop 默认是【居中】裁
-            nv12flag = " --in-nv12"
+        if ve:
+            # 流式硬解：直接从解码器的管道读，连中间那级 ffmpeg 都省了
+            # （它原来只干一件事：把解码器补到 16 对齐的 544 行裁成 540，
+            #   实测每帧 5.1ms CPU）。现在 srpipe 自己带 --in-h 裁。
+            # ★顺序读，不 seek —— 管道里是连续的帧，seek 不了也不需要。
+            cmd = (
+                f'LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
+                f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12 --in-nv12 --in-h {ah} '
+                f'--frames {chunk}{sh_arg}{gpu_arg} '
+                f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
+            )
         else:
-            # 软解路径：解码 + 缩放到源分辨率 + 转 gbrp 平面
-            inarg = (f'-ss {n_done / fps:.6f} -i {shq(src)} '
-                     f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo -')
-            nv12flag = ""
-        cmd = (
-            f'set -o pipefail; ffmpeg -v error -nostdin {inarg} '
-            f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
-            f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{nv12flag}{sh_arg}{gpu_arg} '
-            f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
-        )
+            # 软解路径：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面，喂给 srpipe
+            cmd = (
+                f'set -o pipefail; ffmpeg -v error -nostdin '
+                f'-ss {n_done / fps:.6f} -i {shq(src)} '
+                f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
+                f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
+                f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
+                f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
+            )
         if cancel_requested(jid):
             raise Cancelled()
         # ★这一段是整条流水线里最长的一步（大源要几分钟到十几分钟），
@@ -441,7 +452,11 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                                daemon=True)
         mon.start()
         try:
-            p = run(["bash", "-c", cmd], jid=jid)
+            # VE 流式路：把解码器的管道接到 srpipe 的 stdin。★Python 一直持有这个
+            # 读端 ⇒ 段与段之间解码器不会被 SIGPIPE 打死，它只是写满管道缓冲区后
+            # 阻塞，等下一段来读。少了这一手，长片会在第二段开头就断。
+            p = run(["bash", "-c", cmd], jid=jid,
+                    stdin=(ve[0].stdout if ve else None))
         finally:
             stop_evt.set()
         if p.returncode != 0:
@@ -485,10 +500,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         if got < chunk:
             break                                    # 源已经放完
 
-    # VE 硬解的中间产物用完就删 —— 它是整片源分辨率的 NV12，几百 MB 到几 GB
-    if nv12_src:
-        try: os.remove(nv12_src[0])
-        except OSError: pass
+    # 解码器用完就收 —— 它还挂在管道上，不收就一直占着 VE 硬件
+    _ve_kill(jid)
 
     if not parts:
         raise RuntimeError("没有产出任何编码段 —— 源视频可能读不出来")
@@ -564,7 +577,7 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
             if rc != 0 or not os.path.exists(dst):
                 raise RuntimeError("下载失败:\n" + "\n".join(out.strip().split("\n")[-8:]))
             src = dst
-        set_job(jid, status="running")
+        set_job(jid, status="running", _src=src)   # 记下来，收尾时删它
         if _run_lock.locked():
             set_job(jid, stage="排队等前面的任务跑完（板子只有一个 NPU）")
         with _run_lock:
@@ -578,6 +591,11 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
     except Exception as e:
         set_job(jid, status="error", stage="失败", error=str(e)[:1500],
                 progress=100, detail=traceback.format_exc()[-1500:])
+    finally:
+        # 三条退出路径（成功/取消/失败）都要收：解码器是跨段活着的独立进程，
+        # 漏一条它就挂在管道上不走、还一直占着 VE 硬件；源文件也要删。
+        _ve_kill(jid)
+        sweep_old(jid)
 
 
 # ---------------------------------------------------------------- HTTP
@@ -755,9 +773,65 @@ def sweep_stale():
         print(f"清理了 {n} 个僵死任务", flush=True)
 
 
+KEEP_JOBS = int(_env("SR_KEEP_JOBS", "8"))
+
+
+def sweep_old(jid=None):
+    """删掉没用的东西。两件：
+
+    ① **上传的源文件用完就删。** 它在 DATA 里躺着一份完整副本（实测 20 个任务
+       攒了 604 MB，全是 *.src.*，单个最大 406 MB），成品出来后再没有任何用处 ——
+       失败信息里写的也一直是「重传一次即可」。跑着的任务不删。
+    ② 任务记录只留最近 KEEP_JOBS 个，连同成品文件一起删，免得 jobs.json
+       和磁盘无限涨（用户反馈「任务一直累积，现在有 20 个」）。
+    """
+    rm, rmdir = [], []
+    with _lock:
+        for k, j in _jobs.items():
+            if j.get("status") == "running":
+                continue                      # 还在跑（含排队）的源文件不能动
+            j.pop("_src", None)
+            rm += _files(k, ".src")           # ① 源文件：成品出来就没用了
+        order = sorted(_jobs.items(), key=lambda kv: kv[1].get("created", 0))
+        for k, j in (order[:-KEEP_JOBS] if len(order) > KEEP_JOBS else []):
+            rm += _files(k, "")               # ② 砍掉的旧任务连成品一起删
+            _jobs.pop(k, None)
+        # ③ 孤儿 work 目录：崩溃/被 kill/重启留下的（实测有一个挂了 12 小时）。
+        #    跑着的任务目录不能动，其余全清。
+        try:
+            for d in os.listdir(WORK):
+                if _jobs.get(d, {}).get("status") != "running":
+                    rmdir.append(os.path.join(WORK, d))
+        except OSError:
+            pass
+        _save()
+    for f in rm:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    for d in rmdir:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _files(jid, kind):
+    """DATA 下属于这个任务的文件。kind=".src" 只要源文件，"" = 全要。
+    ★按【文件名】找而不是只认 _src 字段：早期任务记录里没那个字段，
+      只认字段的话它们的源文件永远删不掉（实测残留 7 个）。"""
+    out = []
+    try:
+        for f in os.listdir(DATA):
+            if f.startswith(jid + ".") and (not kind or kind in f):
+                out.append(os.path.join(DATA, f))
+    except OSError:
+        pass
+    return out
+
+
 def main():
     _load()
     sweep_stale()
+    sweep_old()
     SYS.start()
     print(f"A733 视频超分服务  监听 0.0.0.0:{PORT}", flush=True)
     print(f"  NPU: {NBG}  块 {TILE_W}x{TILE_H} x{SR_SCALE} margin={MARGIN}", flush=True)

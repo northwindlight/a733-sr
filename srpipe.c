@@ -225,7 +225,11 @@ static void *gpu_thread(void *arg)
  * 这一级 GPU 只需要跑赢 NPU（实测 gather 远小于 NPU），不需要更深。
  */
 typedef struct {
-    int iw, ih, tw, th, cw, ch, nx, ny, margin, in_nv12;
+    /* ★in_h = 输入缓冲区的【实际高】，ih = 我们要的【裁剪高】。两者分开是因为
+     *   VE 解码器的输出高按 16 对齐（960x540 的源它吐 960x544）：Y 平面是
+     *   iw*in_h，UV 平面从 iw*in_h 开始，但我们只要前 ih 行。
+     *   不给 --in-h 时 in_h = ih，行为与以前完全一致。 */
+    int iw, ih, in_h, tw, th, cw, ch, nx, ny, margin, in_nv12;
     size_t frame_in, tile_in, all_tiles;
     unsigned char *src[3];            /* 主线程从管道读进来的整帧 gbrp */
     unsigned char *tiles[2];          /* GPU 收集出来的瓦片组 */
@@ -357,7 +361,7 @@ static void gather_cpu(const unsigned char *fin, unsigned char *tiles, const gin
  * 否则 tools/gputiletest.sh 会报不一致。 */
 static void gather_nv12_cpu(const unsigned char *fin, unsigned char *tiles, const gin_t *g)
 {
-    const unsigned char *Yp = fin, *UV = fin + (size_t)g->iw * g->ih;
+    const unsigned char *Yp = fin, *UV = fin + (size_t)g->iw * g->in_h;
     const size_t plane = (size_t)g->tw * g->th;
     for (int ty = 0; ty < g->ny; ty++) {
         for (int tx = 0; tx < g->nx; tx++) {
@@ -418,8 +422,18 @@ int main(int argc, char **argv)
 {
     if (argc < 7) {
         fprintf(stderr,
-            "usage: %s <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h>\n"
-            "  读 stdin 的 gbrp 平面帧，输出 scale 倍大的 gbrp 平面帧\n", argv[0]);
+            "usage: %s <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h> [选项]\n"
+            "  读 stdin 的帧（默认 gbrp 平面，--in-nv12 则读 NV12），\n"
+            "  输出 scale 倍大的帧（默认 gbrp，--nv12 则输出 NV12）\n"
+            "  --in-nv12          输入是 NV12（Y 平面 + 交织 CbCr）\n"
+            "  --in-h H           输入缓冲区实际高（默认 = in_h 参数）。\n"
+            "                     VE 解码器输出高按 16 对齐，靠它把补的行裁掉\n"
+            "  --frames N         只处理 N 帧就正常退出（流式分段用）\n"
+            "  --margin N         块间重叠圈\n"
+            "  --nv12             输出 NV12\n"
+            "  --sharpen F        锐化强度\n"
+            "  --gpu / --gpu-in   GPU 做输出转换 / GPU 抠块\n"
+            "  --profile          打印各阶段耗时\n", argv[0]);
         return 2;
     }
     const char *nbg = argv[1];
@@ -430,9 +444,13 @@ int main(int argc, char **argv)
     int profile = 0, use_gpu = 0, use_gpu_in = 0, in_nv12 = 0;
     const char *dump_tiles = NULL;
     int force_float = 0;
+    int in_h = 0;                 /* 输入缓冲区高，0 = 跟 ih 一样 */
+    long max_frames = 0;          /* >0 = 只处理这么多帧就正常收工 */
     for (int i = 7; i < argc; i++) {
         if (!strcmp(argv[i], "--margin") && i + 1 < argc) margin = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nv12")) out_nv12 = 1;
+        else if (!strcmp(argv[i], "--in-h") && i + 1 < argc) in_h = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atol(argv[++i]);
         else if (!strcmp(argv[i], "--sharpen") && i + 1 < argc) sharpen = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
@@ -460,7 +478,9 @@ int main(int argc, char **argv)
     fprintf(stderr, "srpipe: %dx%d -> %dx%d  块 %dx%d (margin %d, core %dx%d)  %dx%d=%d 块/帧\n",
             iw, ih, ow, oh, tw, th, margin, cw, ch, nx, ny, nx * ny);
 
-    const size_t frame_in  = in_nv12 ? (size_t)iw * ih * 3 / 2   /* NV12 = Y + 交织 CbCr */
+    if (in_h <= 0) in_h = ih;
+    if (in_h < ih) die("--in-h 不能小于裁剪高 ih");
+    const size_t frame_in  = in_nv12 ? (size_t)iw * in_h * 3 / 2   /* NV12 = Y + 交织 CbCr */
                                      : (size_t)iw * ih * 3;
     const size_t frame_out = out_nv12 ? (size_t)ow * oh * 3 / 2     /* NV12 = Y + 交织 CbCr(1/2) */
                                       : (size_t)ow * oh * 3;
@@ -479,9 +499,14 @@ int main(int argc, char **argv)
 
     /* ---- 抠块（输入侧）：几何对 CPU/GPU 两条路完全一样 ---- */
     gin_t gin; memset(&gin, 0, sizeof(gin));
-    gin.iw = iw; gin.ih = ih; gin.tw = tw; gin.th = th;
+    gin.iw = iw; gin.ih = ih; gin.in_h = in_h; gin.tw = tw; gin.th = th;
     gin.cw = cw; gin.ch = ch; gin.nx = nx; gin.ny = ny; gin.margin = margin;
     gin.in_nv12 = in_nv12;
+    /* --gpu-in 的内核把 UV 平面写死在 Y 之后（偏移 iw*ih），缓冲区也按 iw*ih 分配，
+     * 装不下 in_h > ih 的输入。这条路本来就默认关、实测也没用（弱 GPU），
+     * 与其去改内核，不如直接拒绝这个组合。 */
+    if (use_gpu_in && in_h != ih)
+        die("--gpu-in 不支持 --in-h（输入缓冲区高 != 裁剪高）；用 CPU 抠块那条路");
     gin.frame_in = frame_in; gin.tile_in = tile_in; gin.all_tiles = all_tiles;
     gin.slot_in = 0; gin.slot_out = 0; gin.stop = 0; gin.posted = 0; gin.done = 0;
     pthread_t gin_tid = 0;
@@ -656,6 +681,11 @@ int main(int argc, char **argv)
 
     long frame = 0;
     for (;;) {
+        /* ★只处理 N 帧就正常收工（--frames）。流式流水线靠它把一条长管道
+         *   切成编码器能吃的段：解码器一直活着往管道里吐，每个段让 srpipe
+         *   读够 N 帧就退出，剩下的字节留在管道里给下一段。
+         *   【不能】在这里多读一个字节 —— 管道里是连续帧，多读就错位了。 */
+        if (max_frames > 0 && frame >= max_frames) break;
         double _t0=_ms();
         /* --- 读一帧 + 抠成瓦片 ---
          * GPU 路径：管道【直接读进】抠块线程的输入槽，主线程一个字节都不搬，
