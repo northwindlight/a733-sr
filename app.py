@@ -248,6 +248,15 @@ def _monitor_srpipe(jid, path, base, total, t_start, stop):
             except OSError:
                 time.sleep(0.3)
                 continue
+        # ★防御：句柄的偏移一旦落在文件末尾之外，readline() 会永远返回空，
+        #   整段读不到东西。文件被截断重写时就会这样（坑见下面 sr_err 每段换名那段）。
+        #   tell() 超过文件大小 = 被截断了，回零重读。
+        try:
+            if f.tell() > os.path.getsize(path):
+                f.seek(0)
+                last = -1
+        except OSError:
+            pass
         line = f.readline()
         if not line:
             time.sleep(0.25)
@@ -473,6 +482,12 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         # 本段从 n_done 帧开始
         seg = os.path.join(wd, f"seg{idx}.h264")
         nv12 = os.path.join(wd, f"seg{idx}.nv12")
+        # ★srpipe 的进度日志每段用一个【独立文件】。共用 sr.err 出过事：
+        #   shell 的 `2>` 在每段开头把它截断，而监控线程的读句柄偏移还停在上一段的
+        #   末尾（~6KB）—— 新文件要长过 6KB 才追得上，可一段 300 帧的日志也就 6KB，
+        #   于是【整段读不到东西】，界面每段只报 base+1 就冻住（实测帧数 601/1201/
+        #   1501/.../4501 全是 base+1）。换名字就没有"截断一个正被读的文件"这回事。
+        sr_err = os.path.join(wd, f"sr{idx}.err")
 
         # srpipe 直接吐 NV12（源×4 分辨率）。★注意：缩放【不是】VE 编码器做的 ——
         # 它只会裁。曾经这里写着"缩放交给 VE，白送"，那句话是错的，代价是用户拿到的
@@ -492,7 +507,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                 f'LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12 --in-nv12 --in-h {ah} '
                 f'--frames {chunk}{sh_arg}{gpu_arg} '
-                f'2> {shq(wd + "/sr.err")}'
+                f'2> {shq(sr_err)}'
             )
         else:
             # 软解路径：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面，喂给 srpipe
@@ -505,7 +520,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                 f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} '
                 f'{W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
-                f'2> {shq(wd + "/sr.err")}'
+                f'2> {shq(sr_err)}'
             )
         # 两条路都在这里收口：SR 出来是源×4，如果不是目标尺寸，就在管道里缩一次。
         if ds:
@@ -523,7 +538,6 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         set_job(jid, stage=f"超分第 {idx+1} 段"
                            f"（{n_done}~{min(n_done + chunk, total_frames or n_done + chunk)} 帧）",
                 progress=max(10, 10 + (n_done / total_frames * 80 if total_frames else 0)))
-        sr_err = os.path.join(wd, "sr.err")
         stop_evt = threading.Event()
         mon = threading.Thread(target=_monitor_srpipe,
                                args=(jid, sr_err, n_done, total_frames, t_sr_start, stop_evt),

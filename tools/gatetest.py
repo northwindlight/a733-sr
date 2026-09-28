@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,6 +81,54 @@ def test_sysmon_live():
     return 0 if ok else 1
 
 
+def test_progress_monitor():
+    """★进度监控必须跟得上 srpipe 的 FRAME 行，包括文件被截断重写之后。
+
+    这里踩过一次真的：每段的 shell 都用 `2> sr.err` **截断**同一个文件，而监控
+    线程的读句柄偏移停在上一段末尾（~6KB）。新日志要长过 6KB 才追得上，可一段
+    300 帧的日志也就 6KB ⇒ **整段读不到**，界面每段只报 base+1 就冻住
+    （实测帧数 601/1201/1501/…/4501 全是 base+1，用户看到的就是这个）。
+    """
+    print("进度监控（要跟得上帧号，截断后要能恢复）")
+    import app
+    d = tempfile.mkdtemp(prefix="gatetest.")
+    path = os.path.join(d, "sr.err")
+    seen = []
+    orig = app.set_job
+    app.set_job = lambda jid, **kw: seen.append(kw.get("frames_done"))
+    stop = threading.Event()
+
+    def burst():
+        with open(path, "a") as f:
+            for n in range(8):
+                f.write(f"FRAME {n}\n")
+                f.flush()
+                time.sleep(0.4)              # 慢于 1s 节流，能出几次更新
+
+    try:
+        with open(path, "w") as f:
+            f.write("srpipe: 960x540 -> 3840x2160 ...\n")   # 不匹配的行
+        threading.Thread(target=app._monitor_srpipe,
+                         args=("t", path, 0, 100000, time.time(), stop),
+                         daemon=True).start()
+        burst()
+        time.sleep(1.2)
+        n1 = len(seen)
+        first = max([x for x in seen if x is not None] or [0])
+        open(path, "w").close()              # ★截断（模拟下一段重写）
+        burst()
+        time.sleep(1.2)
+        n2 = len(seen) - n1
+    finally:
+        stop.set()
+        app.set_job = orig
+    # 坏掉时的特征就是「只报到 base+1」= 1
+    ok = first > 1 and n2 >= 1
+    print(f"{'✓' if ok else '✗'} 截断前报到 {first}（坏掉时恒为 1）、"
+          f"截断后又有 {n2} 次更新{'' if ok else '  ← 没跟上/没恢复！'}")
+    return 0 if ok else 1
+
+
 def main():
     d = tempfile.mkdtemp(prefix="gatetest.")
     cases = []
@@ -108,7 +158,7 @@ def main():
     build(p, 1920, 1080, 75)
     cases.append(("只拼上一半帧（75/150）", p, WANT, True))
 
-    bad = test_sysmon_live()
+    bad = test_sysmon_live() + test_progress_monitor()
     print()
     for name, path, want, should_fire in cases:
         try:
