@@ -4,11 +4,14 @@ A733 视频超分服务 —— 上传/哔哩哔哩链接 -> NPU 超分 -> 下载
 
 流水线（全部在本机 A733 上，不依赖外部机器）：
     [源视频]
-      └ ffmpeg 解码 + 缩放到源分辨率，输出 gbrp 平面帧
-          └ srpipe  ── NPU 分块 x4 超分（块 320x180，带 margin 防接缝）
-              └ ffmpeg 缩放到目标分辨率，输出 NV12
-                  └ vencoderdemo_v2 ── VE 硬编 H.264
-                      └ ffmpeg 混流原音轨 -> mp4
+      └ vdecpipe ── VE 硬解 H.264（流式，一个进程全程活着喂管道）
+          └ srpipe  ── NPU 分块 x4 超分（块 352x224，带 margin 防接缝）
+              └ ffmpeg 缩放到目标分辨率，输出 NV12（★必须在这一步缩：
+                 VE 编码器不会缩，给它小一号的 -d 它只会裁左上角）
+                  └ vencoderdemo_v2 ── VE 硬编 H.264（-s == -d，纯编码）
+                      └ ffmpeg 混流原音轨 -> mp4（★不能用 -shortest，见 README）
+
+（没有 VE 硬解时走软解：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面喂 srpipe。）
 
 分块的原因：NBG 是定形状的。要么把源降采样（丢信息），要么重编形状
 （要重测内存池；640x360 x4 实测会溢出 84MB 池 -> 输出错乱但不报错）。
@@ -30,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
 import sysmon
+from fractions import Fraction
 
 # ---------------------------------------------------------------- 配置
 BASE     = os.path.dirname(os.path.abspath(__file__))
@@ -291,6 +295,12 @@ def run(cmd, jid=None, **kw):
     return subprocess.CompletedProcess(cmd, 0, out, err)
 
 
+def streams(path):
+    p = run(["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_streams", path])
+    return json.loads(p.stdout)["streams"]
+
+
 def probe(path):
     p = run(["ffprobe", "-v", "error", "-print_format", "json",
              "-show_streams", "-show_format", path])
@@ -303,6 +313,9 @@ def probe(path):
     fps = (float(num) / float(den)) if float(den) else 0.0
     return {
         "w": int(v["width"]), "h": int(v["height"]),
+        # ★保留原始有理数帧率。29.97 这类帧率取整成 30 会让音画在长片上错开
+        #   （535 秒的片子差 0.5 秒），所以打时间戳一律用 num/den，不用那个 float。
+        "fps_num": int(float(num)), "fps_den": int(float(den)),
         "fps": fps, "has_audio": a is not None,
         "duration": float(info["format"].get("duration") or 0),
         "nb_frames": int(v.get("nb_frames") or 0),
@@ -311,6 +324,46 @@ def probe(path):
 
 
 # ---------------------------------------------------------------- 流水线
+def check_output(path, want_w, want_h, want_audio, n_done, want_dur, fr):
+    """★产物自证 —— 拿产物的客观量跟【请求】比，不是看 rc、不是看界面标签。
+
+    三个 bug 全都活过了"端到端跑通"的验收，因为验收只看界面上的「完成」：
+      ① `-shortest` 让 aac 编出 0 KiB，产物静音，ffmpeg rc=0
+      ② VE 编码器把 `-d` 当裁剪框，3840x2160 要 1920x1080 就交左上 1/4 画面
+      ③ 裸 H.264 没时间戳，`-r` 没给对就快放（152 帧播 2.0 秒）
+    这里逐条对着请求查，对不上就抛 —— **绝不打印成功**。
+
+    单独抽成函数是为了能拿构造出来的坏文件直接测（tools/gatetest.sh），
+    不用每次都跑一遍五分钟的完整流水线。
+    """
+    st = streams(path)
+    v = next((s for s in st if s["codec_type"] == "video"), None)
+    if v is None:
+        raise RuntimeError("产物里没有视频流")
+    if (int(v["width"]), int(v["height"])) != (want_w, want_h):
+        raise RuntimeError(
+            f"产物分辨率是 {v['width']}x{v['height']}，不是要求的 {want_w}x{want_h}。"
+            f"VE 编码器只会裁不会缩（-d 小于 -s 时它交的是左上角那块），"
+            f"缩放必须由 srpipe 后面那一级 ffmpeg 做。")
+    if want_audio and not any(s["codec_type"] == "audio" for s in st):
+        raise RuntimeError("源有音轨，产物里没有 —— 混音那一步静默丢了音频。")
+    # 容差 ±1 帧：容器里的 nb_frames 是头部元数据，实测连"一段纯 libx264 裸流 concat
+    # 起来"都会报得比实际解码出来的多 1 帧，卡死相等会误报。差一大截（比如少一半）
+    # 才是真故障，那种照样拦得住。
+    nv = int(v.get("nb_frames") or 0)
+    if nv and abs(nv - n_done) > 1:
+        raise RuntimeError(f"产物 {nv} 帧，但编码段加起来是 {n_done} 帧 —— 拼接丢了帧。")
+    # 时长也要对得上：帧数 / 精确帧率。差半帧以上就说明 -r 没吃到真实帧率
+    #   （用 30 顶替 29.97 时，9 分钟的片子会差 0.5 秒，音画后半段就不同步了）。
+    #   容差 2 帧：容器报出来的 duration 实测是 (帧数-1)/帧率（最后一包的时长没算进去），
+    #   卡 1 帧会贴着边界。快放那个 bug 差的是几十帧，2 帧的容差照样拦得住。
+    vd = float(v.get("duration") or 0)
+    if vd and abs(vd - want_dur) > max(2.0 / float(fr), 0.1):
+        raise RuntimeError(
+            f"产物时长 {vd:.3f}s，应该是 {want_dur:.3f}s（{n_done} 帧 / "
+            f"{fr.numerator}/{fr.denominator}）—— 时间戳没按源帧率打。")
+
+
 def npu_env():
     e = dict(os.environ)
     e["LD_LIBRARY_PATH"] = VIP_LIB + ":" + e.get("LD_LIBRARY_PATH", "")
@@ -330,6 +383,10 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     meta = probe(src)
     W, H = meta["w"], meta["h"]
     fps = meta["fps"] or 30.0
+    # 精确帧率（有理数）。ffprobe 给不出有效值时才退回按毫秒近似的那个。
+    # ★这是"音画对准"的基准：产物时长必须是 帧数 / 这个值，音频也按它切。
+    fr = (Fraction(meta["fps_num"], meta["fps_den"])
+          if meta["fps_num"] > 0 and meta["fps_den"] > 0 else Fraction(round(fps * 1000), 1000))
 
     out_w = W * SR_SCALE
     out_h = H * SR_SCALE
@@ -341,17 +398,27 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         final_h = H * scale
         final_w = int(round(W * scale / 2)) * 2
 
-    # 最终尺寸不能超过 SR 出来的尺寸（VE 编码器只会缩、不会放）
+    # 最终尺寸不能超过 SR 出来的尺寸（再大也没有信息）
     if final_h > out_h:
         final_h, final_w = out_h, out_w
+
+    # ★VE 编码器【只会裁、不会缩】。给它 -s 3840x2160 -d 1920x1080，它交出来的不是
+    #   缩小后的整帧，而是**左上角 1920x1080 那一块**（实测：单独把一张正确的 4K NV12
+    #   喂给它，出来就是左上 1/4，和整条流水线的产物一模一样）。vencoder_platform_v2.h
+    #   里那个 Adscaler 是锐化参数，不是缩放器。
+    #   ⇒ 缩放不能交给它：改成在 srpipe 后面挂一级 ffmpeg swscale，并让编码器永远
+    #     -s == -d。走管道 ⇒ 4K 的中间帧不进磁盘，落盘的只有目标尺寸（12.4 -> 3.1 MB/帧）。
+    #   flags=area 是真正的面积平均，实测 24.5 ms/帧（占 850 ms/帧的 3%）。
+    ds = (final_w != out_w or final_h != out_h)
+    mid_w, mid_h = (final_w, final_h) if ds else (out_w, out_h)
 
     tiles_x = -(-W // (TILE_W - 2 * MARGIN))
     tiles_y = -(-H // (TILE_H - 2 * MARGIN))
     npu_ms = W * H * 0.547 / 1000.0            # 实测 0.547 µs/源像素
 
-    # 中间文件是 SR 分辨率（源×4）的 NV12 —— 720p 源就是 22 MB/帧。
-    # 分段大小按它定，把临时盘控在 ~2 GB 以内（原来是按目标尺寸算的，会超）。
-    bytes_per_frame = out_w * out_h * 3 // 2
+    # 落盘的中间文件是**目标**分辨率的 NV12（缩放那一级 ffmpeg 在管道里，4K 不进盘）。
+    # 分段大小按它定，把临时盘控在 ~2 GB 以内。
+    bytes_per_frame = mid_w * mid_h * 3 // 2
     chunk = max(10, min(CHUNK_FRAMES, int(2e9 / max(1, bytes_per_frame))))
 
     total_frames = meta["nb_frames"] or int(meta["duration"] * fps)
@@ -407,11 +474,11 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         seg = os.path.join(wd, f"seg{idx}.h264")
         nv12 = os.path.join(wd, f"seg{idx}.nv12")
 
-        # srpipe 直接吐 NV12（源×4 分辨率），缩放交给 VE 编码器 —— VE 自带缩放，白送。
-        # 这样省掉原来那一步 ffmpeg swscale：实测它是整条流水线的瓶颈
-        # （5120x2880 时 ffmpeg 占 368% CPU，srpipe 才 45%）。
-        # 数据量也砍半：gbrp 3 字节/像素 -> NV12 1.5。
-        # 锐化改由 srpipe 自己做（新路径里 ffmpeg 不参与后期了，不能让开关静默失效）。
+        # srpipe 直接吐 NV12（源×4 分辨率）。★注意：缩放【不是】VE 编码器做的 ——
+        # 它只会裁。曾经这里写着"缩放交给 VE，白送"，那句话是错的，代价是用户拿到的
+        # 每一个 1080p 产物都只有左上 1/4 画面。真正做缩放的是下面管道里那级 ffmpeg。
+        # 数据量砍半：gbrp 3 字节/像素 -> NV12 1.5。
+        # 锐化由 srpipe 自己做，不让开关静默失效。
         sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
@@ -421,22 +488,30 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             # （它原来只干一件事：把解码器补到 16 对齐的 544 行裁成 540，
             #   实测每帧 5.1ms CPU）。现在 srpipe 自己带 --in-h 裁。
             # ★顺序读，不 seek —— 管道里是连续的帧，seek 不了也不需要。
-            cmd = (
+            head = (
                 f'LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12 --in-nv12 --in-h {ah} '
                 f'--frames {chunk}{sh_arg}{gpu_arg} '
-                f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
+                f'2> {shq(wd + "/sr.err")}'
             )
         else:
             # 软解路径：ffmpeg 解码 + 缩放到源分辨率 + 转 gbrp 平面，喂给 srpipe
-            cmd = (
-                f'set -o pipefail; ffmpeg -v error -nostdin '
+            head = (
+                f'ffmpeg -v error -nostdin '
                 f'-ss {n_done / fps:.6f} -i {shq(src)} '
                 f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo - '
                 f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
                 f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{sh_arg}{gpu_arg} '
-                f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
+                f'2> {shq(wd + "/sr.err")}'
             )
+        # 两条路都在这里收口：SR 出来是源×4，如果不是目标尺寸，就在管道里缩一次。
+        if ds:
+            cmd = (f'set -o pipefail; {head} | ffmpeg -v error -nostdin -f rawvideo '
+                   f'-pix_fmt nv12 -s {out_w}x{out_h} -i - '
+                   f'-vf scale={final_w}:{final_h}:flags=area -f rawvideo -pix_fmt nv12 '
+                   f'-y {shq(nv12)}')
+        else:
+            cmd = f'set -o pipefail; {head} > {shq(nv12)}'
         if cancel_requested(jid):
             raise Cancelled()
         # ★这一段是整条流水线里最长的一步（大源要几分钟到十几分钟），
@@ -465,18 +540,19 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         if not os.path.exists(nv12) or os.path.getsize(nv12) < 1024:
             break                                    # 没有更多帧了
 
-        got = os.path.getsize(nv12) // (out_w * out_h * 3 // 2)   # 中间是 SR 分辨率
+        got = os.path.getsize(nv12) // (mid_w * mid_h * 3 // 2)   # 中间已经是目标尺寸
         if got == 0:
             break
 
-        # VE 硬编这一段：-s 给 SR 尺寸、-d 给目标尺寸 —— 缩放由 VE 做
+        # VE 硬编这一段。★-s 和 -d 必须【相等】：编码器不会缩，-d 小了它只会裁。
+        #   尺寸的活已经在上面那级 ffmpeg 干完了，这里就是纯编码。
         set_job(jid, stage=f"硬件编码 第{idx+1}段")
         # ★-r 必须给源帧率：不给的话编码器用自己的默认帧率打时间戳，
         #   152 帧会被塞进 2 秒（实测源 10.2 秒的片子出来播 2.0 秒，快放 5 倍），
         #   而且 dts 非单调、后面 concat 也会跟着错。
         run(["bash", "-c",
              f'LD_LIBRARY_PATH={VENV_DIR} {shq(VENC_BIN)} -i {shq(nv12)} '
-             f'-n {got} -f 0 -o {shq(seg)} -s {out_w}x{out_h} -d {final_w}x{final_h} '
+             f'-n {got} -f 0 -o {shq(seg)} -s {final_w}x{final_h} -d {final_w}x{final_h} '
              f'-r {max(1, int(round(fps)))}'],
             jid=jid)
 
@@ -529,15 +605,33 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     #   结果是产物时长整个是错的（实测源 10.2 秒的片子出来播 2.0 秒，快放 5 倍；
     #   而且不管 80 帧还是 152 帧都恰好 2.0 秒）。把输入帧率钉成源帧率才对。
     #   这个 bug 一直都在，只是没人去核过产物时长。
-    fps_i = max(1, int(round(fps)))
+    # ★★混音这一步有两个坑，都是「rc=0、界面显示完成、东西是错的」：
+    #   ① 不能用 -shortest。concat 进来的裸 H.264 没有时间戳（下面这行 -r 只能补
+    #      输入帧率，补不出每包的 pts），ffmpeg 因此算不出视频流的结束时间，
+    #      于是 -shortest 判定「视频已经结束」⇒ aac 一帧都没编，输出 audio:0KiB。
+    #      实测：加 -shortest 产物无音轨，去掉就有；两次 rc 都是 0。
+    #   ② -map 后面的 ? 会把「映射不到音轨」变成静默通过。既然上面已经确认源有音轨，
+    #      就不要 ? —— 映射失败就该报错。
+    #   下面还有一道产物自证闸兜底（分辨率 / 音轨 / 帧数 / 时长）。
+    # ★帧率用【有理数】原文，不要取整。30 和 30000/1001 差 0.1%，9 分钟的片子
+    #   就是 0.5 秒的累积偏移 —— 画面比声音快半秒，越到后面越明显。
+    #   ffmpeg 的 -r 吃 "30000/1001" 这种写法。
+    fps_r = f"{fr.numerator}/{fr.denominator}"
+    dur = float(Fraction(n_done * fr.denominator, fr.numerator))   # 产物应有的时长
+    # 音频用 atrim 精确切到同一个时长，而不是 -t：-t 是输出级选项，会连视频一起截，
+    # 万一浮点差一点点就把最后一帧切掉（那样 nb_frames 闸会响）。
+    # atrim 只动音频，视频一帧都不碰，两边自然对齐。
     if meta["has_audio"]:
-        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_i} -i {shq(listf)} '
-               f'-i {shq(src)} -map 0:v:0 -map 1:a:0? -c:v copy -c:a aac -b:a 128k '
-               f'-shortest -y {shq(out)}')
+        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
+               f'-i {shq(src)} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 128k '
+               f'-af atrim=end={dur:.6f},asetpts=N/SR/TB -y {shq(out)}')
     else:
-        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_i} -i {shq(listf)} '
+        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
                f'-c:v copy -y {shq(out)}')
     run(["bash", "-c", cmd], jid=jid)
+
+    # ★产物必须自证 —— 见 check_output 的注释（单独抽成函数就为了能拿坏文件直接测）
+    check_output(out, final_w, final_h, meta["has_audio"], n_done, dur, fr)
 
     shutil.rmtree(wd, ignore_errors=True)
     size = os.path.getsize(out)
