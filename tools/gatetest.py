@@ -42,6 +42,43 @@ def build(path, w, h, frames, fps=FPS, audio=True, seconds=None):
     subprocess.run(cmd, check=True)
 
 
+def test_sysmon_live():
+    """★状态栏的采样闸：频率/governor/online 必须每秒重读，不能被缓存。
+
+    这里踩过一次真的：`cpus()` 的整个结果被当"拓扑"缓存，只在服务启动时读一次，
+    于是网页上的每核频率**永远停在服务启动那一刻**。用户看到"小核满频 1716、
+    大核被压 416"，据此判断调速器有问题 —— 而真相是两个簇都已被热管理压到 416。
+    我也拿 API 去"确认"，读到同一份冻结数据，循环论证了一轮。
+
+    做法：把 cpu_live() 换成会变的值，跑两次采样，快照必须跟着变。
+    """
+    print("状态栏采样（每核频率必须每次都重读）")
+    import sysmon
+    static = sysmon.cpus()                       # 真的静态部分（型号/簇号）
+    seq = [{"mhz": 111, "max_mhz": 999, "min_mhz": 1, "gov": "a", "online": True},
+           {"mhz": 222, "max_mhz": 999, "min_mhz": 1, "gov": "b", "online": False}]
+    n = [0]
+
+    def fake_live():
+        v = seq[n[0] if n[0] < len(seq) else -1]
+        return {c["cpu"]: dict(v) for c in static}
+
+    orig = sysmon.cpu_live
+    sysmon.cpu_live = fake_live
+    try:
+        s = sysmon.Sampler()
+        got = []
+        for _ in range(2):
+            got.append([c["mhz"] for c in s._sample()["cpus"]])
+            n[0] += 1                            # ★采完再换值，两次必须不同
+    finally:
+        sysmon.cpu_live = orig
+    ok = got[0] != got[1]
+    print(f"{'✓' if ok else '✗'} 两次采样的频率不同：{got[0]} -> {got[1]}"
+          f"{'' if ok else '  ← 又被缓存了！'}")
+    return 0 if ok else 1
+
+
 def main():
     d = tempfile.mkdtemp(prefix="gatetest.")
     cases = []
@@ -71,7 +108,8 @@ def main():
     build(p, 1920, 1080, 75)
     cases.append(("只拼上一半帧（75/150）", p, WANT, True))
 
-    bad = 0
+    bad = test_sysmon_live()
+    print()
     for name, path, want, should_fire in cases:
         try:
             app.check_output(path, **want)

@@ -193,24 +193,46 @@ def cpu_stat(prev, cur):
 
 
 def cpus():
-    base = "/sys/devices/system/cpu"
+    """每个核的**静态**信息：型号 + 簇号。这两样重启都不会变，调用方可以放心缓存。"""
     model = _cpu_model_map()
     clus = _cluster_of()
-    out = []
-    for c in sorted(clus):
+    return [{"cpu": c, "model": model.get(c, ""), "cluster": clus[c]}
+            for c in sorted(clus)]
+
+
+def cpu_live():
+    """每个核的**动态**信息：频率 / governor / 是否在线。
+
+    ★★这几样【绝不能缓存】。DVFS 每秒都在改 `scaling_cur_freq`，**热管理是直接
+    写 `scaling_max_freq` 来降频的**（所以 max 会等于被压到的那个值），热插拔会改
+    `online`。曾经整个 `cpus()` 的结果被当成"拓扑"缓存起来、只在服务启动时读一次，
+    于是网页上每个核的频率**永远停在服务启动那一刻**：
+    用户看到"小核满频 1716、大核被压 416"，据此判断调速器有问题 ——
+    而真实情况是**两个簇都已经被热管理压到 416MHz**，那个"不对称"纯属冻结快照。
+    我也跟着用 API 去"确认"，读到同一份冻结数据，循环论证了一轮。
+
+    核已下线时 `cpuN/cpufreq` 是指向 policy 的符号链接，读出来是**整个簇**的频率，
+    不是这个核的 —— 所以下线核的频率一律报 None，让界面显示"—"而不是一个假数。
+    """
+    base = "/sys/devices/system/cpu"
+    out = {}
+    for c in _cluster_of():
         d = os.path.join(base, "cpu%d" % c)
+        on = (_read(os.path.join(d, "online")) or "1").strip() != "0"
+        if not on:
+            out[c] = {"mhz": None, "max_mhz": None, "min_mhz": None,
+                      "gov": "", "online": False}
+            continue
         f = _read_int(os.path.join(d, "cpufreq/scaling_cur_freq"))
         fmax = _read_int(os.path.join(d, "cpufreq/scaling_max_freq"))
         fmin = _read_int(os.path.join(d, "cpufreq/scaling_min_freq"))
-        gov = (_read(os.path.join(d, "cpufreq/scaling_governor")) or "").strip()
-        online = (_read(os.path.join(d, "online")) or "1").strip()
-        out.append({
-            "cpu": c, "model": model.get(c, ""), "cluster": clus[c],
+        out[c] = {
             "mhz": None if f is None else round(f / 1000.0),
             "max_mhz": None if fmax is None else round(fmax / 1000.0),
             "min_mhz": None if fmin is None else round(fmin / 1000.0),
-            "gov": gov, "online": online != "0",
-        })
+            "gov": (_read(os.path.join(d, "cpufreq/scaling_governor")) or "").strip(),
+            "online": True,
+        }
     return out
 
 
@@ -343,19 +365,19 @@ class Sampler:
         self._prev = None
         self._th = None
         self._stop = False
-        self._cpus = []
-        self._models = None
+        self._cpus = None            # 只缓存静态部分（型号/簇号）
 
     def _sample(self):
         now = _cpu_times()
         util = cpu_stat(self._prev, now) if self._prev else {}
         self._prev = now
-        if self._models is None:                 # 核型号/簇拓扑重启也不会变，缓存
+        if self._cpus is None:                   # 静态部分（型号/簇号）缓存一次
             self._cpus = cpus()
-            self._models = True
+        live = cpu_live()                        # ★频率/governor/online 每秒重读
         cs = []
         for c in self._cpus:
             d = dict(c)
+            d.update(live.get(c["cpu"], {}))
             d["pct"] = round(util.get(c["cpu"], 0.0), 1) if util else None
             cs.append(d)
         allu = util.get("all")
