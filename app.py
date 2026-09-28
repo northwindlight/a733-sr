@@ -687,6 +687,9 @@ def _pick_cpus():
 
 
 CPUS = _pick_cpus()
+if CPUS and not shutil.which("taskset"):
+    print("警告: 没有 taskset（util-linux），不做钉核", flush=True)
+    CPUS = None
 # 命令行前缀：'taskset -c 6,7 '。不限制时是空串。
 # 用 taskset 而不是 subprocess 的 preexec_fn —— 本服务是多线程的，
 # preexec_fn 在 fork 和线程之间不安全。
