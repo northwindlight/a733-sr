@@ -331,9 +331,12 @@ ffmpeg 因此算不出视频流的结束时间，`-shortest` 便判定"视频已
 （去掉 `?` 一样是 0 KiB），`-shortest` 才是。
 
 **修**：
-- 去掉 `-shortest`；音频改用 `-af atrim=end={时长},asetpts=N/SR/TB` **精确切**，
-  时长 = 帧数 ÷ 精确帧率。不用 `-t`：`-t` 是输出级选项，会连视频一起截，
-  浮点差一点就把最后一帧切掉。
+- 去掉 `-shortest`；改用 `-c:a copy -t {时长}`（时长 = 帧数 ÷ 精确帧率）。
+  **音轨原样复制，不重编码** —— 源多半已经是 aac，重编一代就多一代损失，
+  而这一步本来就没有需要重编的理由（视频也是 copy）。`-t` 实测不会啃掉视频的
+  最后一帧（150 帧的段切完仍是 150 帧）。
+- 复制不进 mp4 的音轨（opus/vorbis 之类）会让 ffmpeg **rc≠0**，这时退回
+  `-c:a aac -b:a 192k -af atrim=end=…,asetpts=N/SR/TB`。失败是响的，不是静默的。
 - `-map 1:a:0?` 的 `?` 也去掉 —— 它把"映射不到音轨"变成静默通过。
 - 加闸：**源有音轨而产物没有 ⇒ 报错，不报「完成」**。
 
@@ -380,6 +383,7 @@ ffmpeg 因此算不出视频流的结束时间，`-shortest` 便判定"视频已
 | `deploy/Caddyfile` | 反向代理 |
 | `deploy/sr-web.service` | systemd 单元 |
 | `tools/seamtest.py` | 接缝量化工具 |
+| `tools/gatetest.py` | **确认产物自证闸真的会响**（造 5 个产物：1 好 4 坏）。不需要板子 |
 | `docs/RUNTIME.md` | 运维手册 + 完整踩坑记录 |
 | `docs/PROVENANCE.md` | **来源清单：每个外部件的出处/版本/许可** |
 

@@ -618,17 +618,24 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     #   ffmpeg 的 -r 吃 "30000/1001" 这种写法。
     fps_r = f"{fr.numerator}/{fr.denominator}"
     dur = float(Fraction(n_done * fr.denominator, fr.numerator))   # 产物应有的时长
-    # 音频用 atrim 精确切到同一个时长，而不是 -t：-t 是输出级选项，会连视频一起截，
-    # 万一浮点差一点点就把最后一帧切掉（那样 nb_frames 闸会响）。
-    # atrim 只动音频，视频一帧都不碰，两边自然对齐。
     if meta["has_audio"]:
-        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
-               f'-i {shq(src)} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 128k '
-               f'-af atrim=end={dur:.6f},asetpts=N/SR/TB -y {shq(out)}')
+        head = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
+                f'-i {shq(src)} -map 0:v:0 -map 1:a:0 -c:v copy ')
+        # ★音轨【原样复制】，不重编码：源多半已经是 aac，重编一代就多一代损失，
+        #   而且这一步本来就没有需要重编的理由（视频也是 copy）。
+        #   -t 精确切到产物时长。实测 150 帧的段切完仍是 150 帧，不会啃掉最后一帧。
+        try:
+            run(["bash", "-c", head + f'-c:a copy -t {dur:.6f} -y {shq(out)}'], jid=jid)
+        except RuntimeError:
+            # 复制不进 mp4 的音轨（opus/vorbis 之类）会在这里失败 —— 失败是响的，
+            # 不是静默的。退回重编码，并用 atrim 精确切音频（-t 那版会连视频一起截）。
+            run(["bash", "-c",
+                 head + f'-c:a aac -b:a 192k -af atrim=end={dur:.6f},asetpts=N/SR/TB '
+                        f'-y {shq(out)}'], jid=jid)
     else:
         cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
                f'-c:v copy -y {shq(out)}')
-    run(["bash", "-c", cmd], jid=jid)
+        run(["bash", "-c", cmd], jid=jid)
 
     # ★产物必须自证 —— 见 check_output 的注释（单独抽成函数就为了能拿坏文件直接测）
     check_output(out, final_w, final_h, meta["has_audio"], n_done, dur, fr)
