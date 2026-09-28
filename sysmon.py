@@ -294,7 +294,8 @@ def gpu():
         m = re.search(r"GPU Utilisation:\s*(\d+)\s*%", txt)
         if m:
             r["load"] = int(m.group(1))
-        blk = re.findall(r"^\s*([A-Za-z][\w]*)\s*:\s*(\d+)\s*%\s*$", txt, re.M)
+        # ★必须以数字开头也算：分项里有 "2D:" 和 "3D:"，用 [A-Za-z] 开头会把它们漏掉
+        blk = re.findall(r"^\s*([A-Za-z0-9][\w]*)\s*:\s*(\d+)\s*%\s*$", txt, re.M)
         if blk:
             r["blocks"] = [{"name": k, "pct": int(v)} for k, v in blk]
     if r["load"] is None:

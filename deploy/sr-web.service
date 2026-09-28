@@ -5,8 +5,12 @@ After=systemd-udev-settle.service
 
 [Service]
 Type=simple
-User=northwind
-Group=northwind
+# ★以 root 跑，唯一原因是 GPU/NPU 的硬件计数器在 debugfs 里，而
+#   /sys/kernel/debug 整个目录是 0700 root —— 普通用户连目录都进不去，
+#   状态栏那两格就只能显示「—」。代价是上传的文件和 ffmpeg/srpipe 子进程
+#   也以 root 跑（本服务只在内网、只收自己人的视频，这个代价接受了）。
+User=root
+Group=root
 WorkingDirectory=/opt/sr
 
 # ★ 这几个必须给，否则 app.py 会退回 BASE/vendor/venc 这类默认值然后 exit 127。

@@ -58,7 +58,7 @@ g++ -O2 -o "$REPO/srpipe" "$REPO/srpipe.c" \
     "$AI_SDK/examples/libawnn_viplite/awnn_lib.c" \
     "$AI_SDK/examples/libawnn_viplite/awnn_quantize.c" \
     -I"$VIP_SRC/inc" -I"$AI_SDK/examples/libawnn_viplite" -I"$AI_SDK" \
-    -L"$VIP_SRC" -Wl,-rpath-link,"$VIP_SRC" -lNBGlinker -lVIPhal -lm
+    -L"$VIP_SRC" -Wl,-rpath-link,"$VIP_SRC" -lNBGlinker -lVIPhal -lOpenCL -lm
 say "srpipe 编好了"
 
 # ---------------------------------------------------------------- 2. 目录 + NBG

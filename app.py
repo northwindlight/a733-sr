@@ -352,11 +352,36 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                                f'-c:v copy -bsf:v h264_mp4toannexb -f h264 {shq(raws)}'], jid=jid)
             # ② 硬解整片 → NV12。★-ss 0 -sn N 必须给：demo 默认「一帧都不存且不报错」
             n = max(1, total_frames) + 8
+            # ★这一段对长片要跑几分钟到十几分钟（受 eMMC 写入限速），而且它是
+            #   一个不可中断的子进程 —— 不给进度的话界面就冻在 6%，看着像卡死
+            #   （用户实测反馈"卡了半天"）。demo 自己不报进度，就盯输出文件大小。
+            ve_exp = W * ah * 3 // 2 * max(1, total_frames)
+            ve_stop = threading.Event()
+
+            def _ve_tick():
+                while not ve_stop.wait(3.0):
+                    try:
+                        g = os.path.getsize(dump) // (W * ah * 3 // 2)
+                    except OSError:
+                        continue
+                    set_job(jid, stage=f"VE 硬解中 {g}/{total_frames} 帧"
+                                       f"（专用硅解码，这段 CPU 不参与）",
+                            progress=min(9, 5 + 4 * os.path.getsize(dump) / max(1, ve_exp)))
+
+            ve_th = threading.Thread(target=_ve_tick, daemon=True)
+            ve_th.start()
             run(["bash", "-c", f'LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu {shq(VDEC_BIN)} '
                                f'-i {shq(raws)} -codFmat 1 -o {shq(dump)} -outFmat 6 '
                                f'-n {n} -ss 0 -sn {n}'], jid=jid)
-            if os.path.getsize(dump) >= W * ah * 3 // 2:
+            ve_stop.set()
+            # ★必须按【整片】验，不能只验「≥1 帧」。硬解半路停掉（磁盘满/驱动抽风）
+            #   会留下一个能用的短文件，后面每段都"正常"跑完，最后静默交半个视频。
+            fsz = W * ah * 3 // 2
+            got_f = os.path.getsize(dump) // fsz
+            if os.path.getsize(dump) >= fsz * max(1, total_frames) * 98 // 100:
                 nv12_src = (dump, ah)
+            elif got_f >= 1:
+                set_job(jid, stage=f"硬解只出了 {got_f}/{total_frames} 帧，退回软解")
             else:
                 set_job(jid, stage="硬解没出东西，退回软解")
             for f in (raws, dump) if not nv12_src else (raws,):
@@ -396,7 +421,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                      f'-frames:v {chunk} -an -vf scale={W}:{H} -pix_fmt gbrp -f rawvideo -')
             nv12flag = ""
         cmd = (
-            f'ffmpeg -v error -nostdin {inarg} '
+            f'set -o pipefail; ffmpeg -v error -nostdin {inarg} '
             f'| LD_LIBRARY_PATH={VIP_LIB} {shq(NPU_BIN)} {shq(NBG)} {W} {H} {SR_SCALE} '
             f'{TILE_W} {TILE_H} --margin {MARGIN} --nv12{nv12flag}{sh_arg}{gpu_arg} '
             f'2> {shq(wd + "/sr.err")} > {shq(nv12)}'
@@ -431,9 +456,13 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
 
         # VE 硬编这一段：-s 给 SR 尺寸、-d 给目标尺寸 —— 缩放由 VE 做
         set_job(jid, stage=f"硬件编码 第{idx+1}段")
+        # ★-r 必须给源帧率：不给的话编码器用自己的默认帧率打时间戳，
+        #   152 帧会被塞进 2 秒（实测源 10.2 秒的片子出来播 2.0 秒，快放 5 倍），
+        #   而且 dts 非单调、后面 concat 也会跟着错。
         run(["bash", "-c",
              f'LD_LIBRARY_PATH={VENV_DIR} {shq(VENC_BIN)} -i {shq(nv12)} '
-             f'-n {got} -f 0 -o {shq(seg)} -s {out_w}x{out_h} -d {final_w}x{final_h}'],
+             f'-n {got} -f 0 -o {shq(seg)} -s {out_w}x{out_h} -d {final_w}x{final_h} '
+             f'-r {max(1, int(round(fps)))}'],
             jid=jid)
 
         os.remove(nv12)
@@ -464,6 +493,16 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     if not parts:
         raise RuntimeError("没有产出任何编码段 —— 源视频可能读不出来")
 
+    # ★产出帧数必须和源对得上，少一大截就是出了故障，【不能报「完成」】。
+    #   这个闸是拿血换的：srpipe 因为不认 --in-nv12，每段都少读一半帧、
+    #   每段都"正常"结束，于是任务显示完成、给下载，交出去半个视频 ——
+    #   界面上一切正常，只有文件大小不对（用户就是这样发现的）。
+    if total_frames and n_done < total_frames * 98 // 100:
+        raise RuntimeError(
+            f"只产出了 {n_done}/{total_frames} 帧就断了，不当作成功。"
+            f"上游提前结束（不是源真的放完了）。常见原因："
+            f"srpipe / 编码器与当前调用参数不匹配（例如二进制没跟着 app.py 一起更新）。")
+
     # ---------- 拼接 + 混音 ----------
     set_job(jid, stage="拼接", progress=92)
     listf = os.path.join(wd, "parts.txt")
@@ -472,12 +511,18 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             f.write(f"file '{pth}'\n")
 
     out = os.path.join(DATA, jid + ".mp4")
+    # ★-r 必须在 -i【之前】：那几段是裸 H.264（elementary stream 里根本没有时间戳），
+    #   ffmpeg 解析时一律按默认 25fps 打点，跟源的真实帧率毫无关系 ——
+    #   结果是产物时长整个是错的（实测源 10.2 秒的片子出来播 2.0 秒，快放 5 倍；
+    #   而且不管 80 帧还是 152 帧都恰好 2.0 秒）。把输入帧率钉成源帧率才对。
+    #   这个 bug 一直都在，只是没人去核过产物时长。
+    fps_i = max(1, int(round(fps)))
     if meta["has_audio"]:
-        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -i {shq(listf)} '
+        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_i} -i {shq(listf)} '
                f'-i {shq(src)} -map 0:v:0 -map 1:a:0? -c:v copy -c:a aac -b:a 128k '
                f'-shortest -y {shq(out)}')
     else:
-        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -i {shq(listf)} '
+        cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_i} -i {shq(listf)} '
                f'-c:v copy -y {shq(out)}')
     run(["bash", "-c", cmd], jid=jid)
 

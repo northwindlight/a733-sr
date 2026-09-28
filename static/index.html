@@ -93,9 +93,7 @@
   .btn.ghost:hover{border-color:var(--acc);color:var(--acc)}
   button:disabled{opacity:.45;cursor:default}
 
-  .hint{color:var(--dim);font-size:12.5px;line-height:1.8;margin-top:16px;
-        padding-top:14px;border-top:1px solid var(--line)}
-  .hint b{color:var(--fg);font-weight:600}
+  /* 说明文字一律不放界面上；保留 .note 只给"读不到"那一句用 */
 
   /* ---- 任务 ---- */
   .job{padding:14px 0;border-top:1px solid var(--line)}
@@ -171,15 +169,6 @@
       <button class="btn" id="go">开始超分</button>
     </div>
 
-    <div class="hint">
-      <b>速度参考</b>（NPU 代价 ∝ 源总像素，约 0.547 µs/像素）：
-      360p 源 ≈ 3.6 帧/秒 · 480p ≈ 2 帧/秒 · 720p ≈ 0.8 帧/秒。
-      源分辨率越高越慢 —— 硬件决定，不是可以调优的地方。<br>
-      <b>模型是 x4 的</b>，NPU 中间帧固定是<b>源×4</b>，再由 VE 缩放到你选的输出尺寸。
-      <b>"跟随源 ×N"</b> = 不做固定分辨率，直接按源的 N 倍输出。<br>
-      <b>关于"油画感"</b>：这是 animevideov3 用在<b>实拍</b>素材上的固有毛病（它是给动画调的轻量模型）。
-      锐化只补边缘、补不回纹理；根治要换实拍向的模型（realesr-general-x4v3，同架构、约 2× 慢）。
-    </div>
   </div>
 
   <div class="card">
@@ -289,17 +278,13 @@ function buildDetail(){
     // 所以只在【顺序真的变了】时重建行，其余时候原地改数值（不闪、hover 不断）。
     const order = (SYS?.temps || []).map(t => t.zone).join(',');
     if(!R.rows || R.tempOrder !== order){
-      d.innerHTML = '<h3>温度传感器（按温度降序）· 满格 = 各自的降频阈值</h3>'
+      d.innerHTML = '<h3>温度传感器（按温度降序）</h3>'
         + (SYS?.temps || []).map(() => `
         <div class="mrow">
           <span class="nm"></span>
           <span class="bw"><i></i></span>
           <span class="vl"></span>
-        </div>`).join('') +
-        `<div class="note">每行的进度条量程是<b>该传感器自己的首个降频阈值</b>（行尾 /数字），
-         所以条的长短不能跨行直接比：同样 50°C，对 CPU（阈值 60°C）才 83%，
-         对板面 skin（阈值 50°C）已经到线了 —— 温度数字变黄/变红就是这个意思。
-         带「空闲」的是热管理用来做基准的辅助区，不是主传感器，但读数是真的。</div>`;
+        </div>`).join('');
       R.rows = [...d.querySelectorAll('.mrow')];
       R.tempOrder = order;
     }
@@ -325,10 +310,7 @@ function buildDetail(){
         <span class="bw"><i></i></span>
         <span class="vl"></span></div>`).join('');
     });
-    d.innerHTML = h + `<div class="note">利用率来自 /proc/stat 两次求差。
-      同一簇内各核共用一套 DVFS，所以频率数值相同是正常的。
-      这一栏最能说明问题的场景是：<b>NPU 在跑时 CPU 应该是空的</b>——
-      若 CPU 满载而进度不动，那才是真的没走 NPU。</div>`;
+    d.innerHTML = h;
     R.cpu = [...d.querySelectorAll('.mrow')];
     R.cl = [...d.querySelectorAll('[data-cl]')];
   }
@@ -359,9 +341,7 @@ function buildDetail(){
         <dt>已运行</dt><dd>${mi?.uptime_s ? Math.floor(mi.uptime_s/3600) + ' 小时 ' +
              Math.floor(mi.uptime_s % 3600/60) + ' 分' : '—'}</dd>
         <dt>SoC</dt><dd>${esc(mi?.soc || '—')}</dd>
-      </dl>
-      <div class="note">交换区在 zram 上，有占用不等于变慢，但占用高说明物理内存确实紧张。
-      <b>板子只有 1 GB</b>，超分任务跑起来会明显吃紧。</div>`;
+      </dl>`;
     R.rows = [...d.querySelectorAll('.mrow')];
     R.rowsData = rows;
   }
@@ -370,13 +350,7 @@ function buildDetail(){
     const o = (openKey === 'npu' ? SYS?.npu : SYS?.gpu) || {};
     let h = `<h3>${openKey.toUpperCase()} 负载</h3>`;
     if(o.load == null){
-      h = `<h3>不可用</h3><div class="note">${esc(o.note || '读不到')}。<br>
-        硬件计数器是有的（NPU 在 <code>/sys/kernel/debug/viplite/core_loading</code>，
-        GPU 在 <code>/sys/kernel/debug/pvr/status</code>），但 <b>/sys/kernel/debug 整个目录是
-        0700 root</b>，本服务以普通用户跑，进不去。</div>`;
-      if(openKey === 'npu' && o.freq_mhz)
-        h += `<h3>时钟</h3><dl class="kv"><dt>当前 / 最高</dt>
-              <dd>${o.freq_mhz} / ${o.max_mhz} MHz</dd></dl>`;
+      h = `<h3>不可用</h3><div class="note">${esc(o.note || '读不到')}</div>`;
       d.innerHTML = h; return;
     }
     h += `<div class="mrow"><span class="nm">总利用率</span>
