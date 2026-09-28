@@ -141,12 +141,15 @@ def _cpu_times():
 
 
 def _cpu_model_map():
-    """cpu号 -> 核型号。从 /proc/cpuinfo 的 CPU part 取。"""
+    """cpu号 -> 核型号。从 /proc/cpuinfo 的 CPU part 取。
+
+    ★`/proc/cpuinfo` **不列已下线的核**，所以下线之后整簇的型号会变空
+    （界面上就剩"小核 · "）。补一个 DT 兜底：`/proc/device-tree/cpus/cpu@N/compatible`
+    是静态的，核下线也在（`arm,cortex-a55` / `arm,cortex-a76`）。
+    """
     m, cur = {}, None
     s = _read("/proc/cpuinfo")
-    if not s:
-        return m
-    for ln in s.splitlines():
+    for ln in (s or "").splitlines():
         k, _, v = ln.partition(":")
         k, v = k.strip(), v.strip()
         if k == "processor":
@@ -156,11 +159,35 @@ def _cpu_model_map():
                 cur = None
         elif k == "CPU part" and cur is not None:
             m[cur] = _ARM_PARTS.get(v.lower(), "ARM " + v)
+    for c in _cluster_of():
+        if m.get(c):
+            continue
+        # DT 节点名是【寄存器地址】不是序号（cpu@0 / cpu@100 / cpu@200 …），
+        # 别想当然按 %x 拼。走 of_node 这个符号链接最稳。
+        # ★必须 realpath 不能 readlink：of_node 的 target 是**相对路径**
+        #   （`../../../../firmware/devicetree/base/cpus/cpu@0`），readlink 拿到的
+        #   还是相对的，拼上 /compatible 后 _read 会相对 cwd 去开 → 静默失败 → 型号空白。
+        node = os.path.realpath("/sys/devices/system/cpu/cpu%d/of_node" % c)
+        if not os.path.isdir(node):
+            continue
+        comp = _read(os.path.join(node, "compatible")) or ""
+        arm = next((t for t in comp.split("\0") if t.startswith("arm,cortex-")), "")
+        if arm:
+            m[c] = arm.split(",", 1)[1].replace("-", " ").title().replace(" ", "-")
     return m
 
 
 def _cluster_of():
-    """cpu号 -> cluster 号（按 cpufreq policy 分组：同 policy 即同簇）。"""
+    """cpu号 -> cluster 号（按 cpufreq policy 分组：同 policy 即同簇）。
+
+    ★不能要求 policy 目录存在。核下线后 `cpuN/cpufreq` 会变成**悬空**符号链接
+    （整簇没有在线核时 cpufreq 策略被摘掉，`policy0` 整个目录消失），
+    原来那句 `os.path.isdir(pol)` 就会把整个簇从界面上抹掉 ——
+    而用户恰恰想看见"它们已经离线了"。悬空链接的 target 字符串仍然带着
+    policy 号（`../cpufreq/policy0`），`readlink` 拿得到。
+    万一连链接都没了，退化成按 `cpu_capacity` 分组（同容量 = 同簇，
+    A733 是 385 / 1024 两档）。
+    """
     rid, out = {}, {}
     base = "/sys/devices/system/cpu"
     try:
@@ -169,10 +196,12 @@ def _cluster_of():
     except OSError:
         return out
     for c in sorted(cpus, key=lambda x: int(x[3:])):
-        pol = os.path.realpath(os.path.join(base, c, "cpufreq"))
-        if not os.path.isdir(pol):
-            continue
-        out[int(c[3:])] = rid.setdefault(pol, len(rid))
+        d = os.path.join(base, c)
+        try:
+            key = os.readlink(os.path.join(d, "cpufreq"))
+        except OSError:
+            key = "cap:" + (_read(os.path.join(d, "cpu_capacity")) or "?").strip()
+        out[int(c[3:])] = rid.setdefault(key, len(rid))
     return out
 
 

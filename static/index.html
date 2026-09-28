@@ -380,6 +380,13 @@ function paintDetail(){
   if(openKey === 'cpu' && R.cpu){
     R.cpu.forEach(el => {
       const c = SYS.cpus.find(x => x.cpu == el.dataset.cpu); if(!c) return;
+      // 下线的核：没有频率可报（cpuN/cpufreq 是悬空链接，读出来会是整簇的值），
+      // 显示"—M"会让人以为是读不到，所以直接写"离线"。
+      if(c.online === false){
+        el.querySelector('.bw i').style.width = '0';
+        el.querySelector('.vl').innerHTML = '<small style="opacity:.6">离线</small>';
+        return;
+      }
       const p = c.pct || 0;
       el.querySelector('.bw i').style.width = Math.max(p, p > 0 ? 1.5 : 0) + '%';
       el.querySelector('.vl').innerHTML = `${Math.round(p)}% <small>${c.mhz ?? '—'}M</small>`;
