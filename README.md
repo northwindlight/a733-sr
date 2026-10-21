@@ -181,7 +181,23 @@ git clone https://github.com/northwindlight/a733-sr && cd a733-sr
 sudo bash deploy/install.sh          # 装 udev 规则、编译 srpipe、拉 NBG、装服务
 ```
 
-然后浏览器打开 `http://<板子IP>/`。
+然后浏览器打开 **http://radxa.lan/**，也可以用 `http://<板子IP>/`。
+`radxa.lan` 需要由客户端所用的局域网 DNS 解析到板子 IP（当前部署为 `192.168.1.219`）。
+
+Web 由 systemd 管理：`sr-web.service` 运行 `/opt/sr/app.py`，监听 `0.0.0.0:8080`；
+`caddy.service` 监听 80，将域名及 IP 请求转发到 `127.0.0.1:8080`。两者均设置开机启动。
+入口使用 HTTP，配置不会把 `.lan` 自动跳转到 HTTPS。
+
+访问失败时可在板上核对：
+
+```bash
+systemctl status sr-web caddy --no-pager
+curl --noproxy '*' -sS -o /dev/null -w '%{http_code}\n' http://radxa.lan/
+curl --noproxy '*' -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/
+```
+
+若 IP 可以访问而域名不行，检查客户端 DNS 对 `radxa.lan` 的解析；若访问日志没有对应请求，
+说明请求尚未到达 Caddy。
 
 `install.sh` 会从 [a733-npu](https://github.com/northwindlight/a733-npu) 的
 Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码来编 `srpipe`。
