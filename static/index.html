@@ -151,6 +151,20 @@
     </div>
 
     <div class="fields">
+      <label>模型</label>
+      <select id="model"></select>
+    </div>
+    <div style="color:var(--dim);font-size:12px;margin:0 0 12px" id="modelNote"></div>
+    <div class="fields">
+      <label>字幕保护</label>
+      <select id="preserve">
+        <option value="0.2" selected>底部 20%（推荐）</option>
+        <option value="0.3">底部 30%</option>
+        <option value="0">关</option>
+      </select>
+    </div>
+    <div style="color:var(--dim);font-size:12px;margin:0 0 12px">保护区域的亮度按原图插值放大，保留字形与笔画；也会保留该区域原有的模糊和压缩痕迹。无字幕时可关闭。</div>
+    <div class="fields">
       <label>输出</label>
       <select id="res">
         <option value="720">720p</option>
@@ -162,8 +176,8 @@
       </select>
       <label>锐化</label>
       <select id="sharp">
-        <option value="0">关</option>
-        <option value="0.4" selected>轻（推荐）</option>
+        <option value="0" selected>关（推荐）</option>
+        <option value="0.4">轻</option>
         <option value="0.8">强</option>
       </select>
       <button class="btn" id="go">开始超分</button>
@@ -450,7 +464,8 @@ function readRes(){
 async function upload(file){
   const fd = new FormData();
   const q = new URLSearchParams(Object.assign(
-    {name: file.name, sharp: $('#sharp').value}, readRes()));
+    {name: file.name, sharp: $('#sharp').value, model: $('#model').value,
+     preserve:$('#preserve').value}, readRes()));
   setBusy(true);
   const xhr = new XMLHttpRequest();      // 用 XHR 才有上传进度
   xhr.open('POST', '/api/upload?' + q);
@@ -473,7 +488,8 @@ async function viaUrl(){
   setBusy(true);
   const r = await (await fetch('/api/url', {method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(Object.assign({url, sharp:+$('#sharp').value}, readRes()))})).json();
+      body: JSON.stringify(Object.assign({url, sharp:+$('#sharp').value, model:$('#model').value,
+                                         preserve:+$('#preserve').value}, readRes()))})).json();
   setBusy(false);
   if(r.id) start(r.id); else alert(r.error || '失败');
 }
@@ -527,7 +543,7 @@ function render(){
       ${j.eta_s > 60 ? `<span class="num">约剩 ${Math.round(j.eta_s/60)} 分</span>` : ''}
       ${j.meta ? `<span>源 ${esc(j.meta.src)}</span>
                   <span>输出 <b>${esc(j.meta.final)}</b></span>
-                  <span title="NBG 是 x4 的，中间帧必然是源×4，随后由 VE 缩放到输出尺寸">NPU 中间帧 ${esc(j.meta.sr)}</span>
+                  ${j.meta.model ? `<span>${esc(j.meta.model)}</span>` : ''}
                   <span>${j.meta.tiles} 块/帧</span>` : ''}
       ${j.size ? `<span class="num">${(j.size/1048576).toFixed(1)} MB</span>` : ''}
       ${j.took ? `<span class="num">耗时 ${j.took}s</span>` : ''}
@@ -557,6 +573,16 @@ $('#goUrl').onclick = viaUrl;
 $('#go').onclick = () => $('#file').click();
 
 sysConnect();
+fetch('/api/models').then(r=>r.json()).then(d=>{
+  $('#model').innerHTML=d.models.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
+  $('#model').value=d.default;
+  $('#model').onchange=()=>{
+    $('#modelNote').textContent=$('#model').value==='animejanai'
+      ? '适合 MMD / 动画；原生 2 倍，更高分辨率用 Lanczos 继续放大。'
+      : '原生 4 倍；可按所选输出分辨率缩小。';
+  };
+  $('#model').onchange();
+}).catch(()=>{ $('#modelNote').textContent='模型列表加载失败，请刷新页面'; });
 
 // 打开页面时恢复现场：接着显示最新的那个任务，在跑就继续轮询
 fetch('/api/jobs').then(r=>r.json()).then(d=>{

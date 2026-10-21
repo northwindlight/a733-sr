@@ -14,6 +14,29 @@
 
 ---
 
+## 现行默认：MMD / 动画与字幕
+
+默认模型为 **AnimeJaNai HD V3 UltraCompact（原生 x2）**，输入块 352×224。
+网页可选旧 AnimeVideo x4 或通用 RealESR General x4（安装了对应文件才显示）。
+原生 x2 以上的输出尺寸使用 Lanczos 继续放大，界面有说明；原生 x2 不等于原生 x4。
+
+- 修正了 gbrp 的 G/B/R 与模型 R/G/B 通道顺序；抠块转 RGB，拼帧转回 GBR。
+- 默认关闭后置锐化。默认**底部 20% 字幕保护**：该区域的亮度按源图双线性插值，
+  保留原始字形；色度仍来自模型。边界渐变 4 个源像素。可选底部 30% 或关闭。
+  这是明确区域的保真，不识别字幕位置，也会保留原有模糊和压缩痕迹。
+- GPU 做字幕保护与色彩转换，CPU 回退实现逐字节一致；分块仍使用 NPU。
+- NEON 查表拼帧，减少 CPU 工作；GPU 平面缓冲区按实际尺寸分配。
+- NBG 形状/倍率不匹配、未知命令行参数直接拒绝，防止静默坏图。
+- 补齐 VE 硬解遗漏的 1–2 个尾帧，明确每包时长；已知源帧数对不上就报错。
+
+模型由 [the-database](https://github.com/the-database/mpv-AnimeJaNai/releases/tag/3.0.0)
+训练，权重及其 NBG 变体遵守 [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)。
+修改内容：静态 ONNX 导出、DIV2K 16 张图校准、A733 uint8 NBG 编译。
+模型构建源码与 SHA256 见 [a733-npu](https://github.com/northwindlight/a733-npu/tree/main/models/animejanai_v3_x2)。
+服务代码仍为 MPL-2.0，模型许可单独适用。
+
+验收与性能记录见 [2026-10-21 验证报告](docs/20261021-validation.md)。
+
 ## 这块板子的实际水平（全部实测，非规格推算）
 
 | | 实测 |
@@ -88,10 +111,7 @@ margin 0 便宜得多但有静态竖缝，不能要。**正确做法是把 NBG �
 **关键在于它位置固定、每帧一样**——静态竖线正是人眼最敏感的东西，
 比同量级的随机噪声恶劣得多。所以默认开 `--margin 16`。
 
-**而且代价不额外增加**：640×360 源无 margin 是 2×2=4 块，带 margin 是 3×3=9 块，
-但总处理像素都是 518K（640/320=2 整除，加任何 margin 都要多围一圈）。
-换个更大的块（480×270 无 margin 也是 4 块）总像素一模一样。
-**一样贵，前者无接缝。**
+margin 会增加块数和计算量；不能把防接缝视为免费。
 
 复现：
 
@@ -174,7 +194,9 @@ Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码�
 | `SR_VIP_LIB` | `vendor/viplite` | VIP Lite 运行库目录 |
 | `SR_VENC_DIR` | `vendor/venc` | `libvencoder` 那一套（含 `vencoderdemo_v2`） |
 | `SR_VENC_BIN` | `$SR_VENC_DIR/vencoderdemo_v2` | VE 编码器 demo 可执行文件 |
-| `SR_NBG` | `models/anv3.nb` | NPU 模型 |
+| `SR_DEFAULT_MODEL` | `animejanai`（已安装时） | 默认模型；`anime` 为旧动画，`general` 为通用 |
+| `SR_NBG` | `models/anv3_352x224.nb` | 覆盖旧动画模型路径，几何仍为 x4 / 352×224 |
+| `SR_CHUNK_FRAMES` | `300` | 分段帧数，临时文件另受约 2 GB 上限限制 |
 | `SR_COOKIES` | `bili_cookies.txt` | 哔哩哔哩 cookie（可选，**别提交**） |
 | `SR_SYS_CLIENTS` | `4` | 状态栏最多允许几条 SSE 长连接 |
 | `SR_CPUSET` | 自动（容量最大的那组核） | 重活钉在哪些核上，如 `6,7`；`0` = 不限制 |

@@ -12,7 +12,10 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 SR_DIR=${SR_DIR:-/opt/sr}
 RUN_USER=${SR_RUN_USER:-${SUDO_USER:-$(id -un)}}
 AI_SDK=${AI_SDK:-$HOME/ai-sdk}
-NBG_URL=${NBG_URL:-https://github.com/northwindlight/a733-npu/releases/download/nbg-animevideov3_352x224-v3/network_binary.nb}
+NBG_BASE=https://github.com/northwindlight/a733-npu/releases/download/nbg-animejanai_v3_x2-v3
+NBG_URL=${NBG_URL:-$NBG_BASE/network_binary.nb}
+NBG_INFO_URL=${NBG_INFO_URL:-$NBG_BASE/build_info.json}
+NBG_NAME=${NBG_NAME:-animejanai_v3_x2.nb}
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; exit 1; }
@@ -66,19 +69,29 @@ say "建 $SR_DIR"
 mkdir -p "$SR_DIR"/{models,static,data,work,vendor}
 install -m755 "$REPO/srpipe"        "$SR_DIR/srpipe"
 install -m644 "$REPO/app.py"        "$SR_DIR/app.py"
+install -m644 "$REPO/sysmon.py"     "$SR_DIR/sysmon.py"
 install -m644 "$REPO/static/index.html" "$SR_DIR/static/index.html"
 install -m644 "$REPO/README.md"     "$SR_DIR/README.md"
 
 # VIP 运行库：拷进来，免得到处配 LD_LIBRARY_PATH
 cp -a "$VIP_SRC"/libNBGlinker.so "$VIP_SRC"/libVIPhal.so "$SR_DIR/vendor/" 2>/dev/null || true
 
-if [ -s "$SR_DIR/models/anv3_352x224.nb" ]; then
+if [ -s "$SR_DIR/models/$NBG_NAME" ]; then
     say "已有 NBG，跳过下载"
 else
     say "下载 NBG（$NBG_URL）"
-    curl -fL --retry 3 -o "$SR_DIR/models/anv3_352x224.nb" "$NBG_URL" \
-        || die "下载失败。也可以自己用 a733-npu 编一个，放到 $SR_DIR/models/anv3_352x224.nb"
+    curl -fL --retry 3 -o "$SR_DIR/models/$NBG_NAME" "$NBG_URL" || die "模型下载失败"
 fi
+if [ ! -s "$SR_DIR/models/$NBG_NAME.build_info.json" ]; then
+    curl -fL --retry 3 -o "$SR_DIR/models/$NBG_NAME.build_info.json" "$NBG_INFO_URL" || die "模型元数据下载失败"
+fi
+python3 - "$SR_DIR/models/$NBG_NAME" <<'PY'
+import hashlib, json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+info = json.loads(pathlib.Path(str(p) + '.build_info.json').read_text())
+assert hashlib.sha256(p.read_bytes()).hexdigest() == info['artifacts']['nbg']['sha256'], 'NBG SHA256 不匹配'
+assert not info['calib']['fallback_to_random'], '不能安装噪声校准模型'
+PY
 
 # VE 编解码那套（libvencoder 等）不在本仓库里，见 docs/RUNTIME.md
 VENC_DIR=${SR_VENC_DIR:-/home/$RUN_USER/venc2}

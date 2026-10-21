@@ -81,7 +81,30 @@ VE_MAX_INTERMEDIATE = int(_env("SR_VE_MAX_GB", "20")) << 30   # 流式改造后�
 TILE_W, TILE_H = 352, 224      # 必须等于 NBG 的输入形状
 SR_SCALE       = 4             # 该 NBG 是 x4
 MARGIN         = 16            # 分块防接缝的余量（实测 16 足够：边界差 2.07 -> 0.00）
-CHUNK_FRAMES   = 300           # 每个编码分段的帧数，限制临时盘占用
+CHUNK_FRAMES   = int(_env("SR_CHUNK_FRAMES", "300"))
+
+# 每个任务固定自己的模型与几何，不能在全局变量间切换（HTTP 请求可并发）。
+MODELS = {
+    "animejanai": {"name": "AnimeJaNai HD V3 · 原生 2 倍", "scale": 2,
+                  "path": os.path.join(BASE, "models", "animejanai_v3_x2.nb"),
+                  "tile_w": 352, "tile_h": 224, "margin": 16},
+    "anime": {"name": "AnimeVideo v3 · 原生 4 倍（旧模型）", "scale": 4,
+              "path": NBG, "tile_w": TILE_W, "tile_h": TILE_H, "margin": MARGIN},
+    "general": {"name": "RealESR General v3 · 原生 4 倍", "scale": 4,
+                "path": os.path.join(BASE, "models", "realesr_general_352x224.nb"),
+                "tile_w": 352, "tile_h": 224, "margin": 36},
+}
+DEFAULT_MODEL = _env("SR_DEFAULT_MODEL", "animejanai" if os.path.isfile(MODELS["animejanai"]["path"]) else "anime")
+
+
+def model_config(model_id=None):
+    model_id = model_id or DEFAULT_MODEL
+    if model_id not in MODELS:
+        raise ValueError("未知超分模型")
+    m = MODELS[model_id]
+    if not os.path.isfile(m["path"]):
+        raise ValueError("该模型尚未安装")
+    return model_id, m
 
 PORT = int(os.environ.get("SR_PORT", "8080"))
 
@@ -379,12 +402,15 @@ def npu_env():
     return e
 
 
-def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
+def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, preserve=0.2):
     """
     scale    : 用户选的"超分倍率" 2 或 4 —— 只影响最终输出尺寸，不影响 NPU 代价
     target_h : 用户选的最终高度（0 = 自动 = 源高 * scale）
     """
     wd = os.path.join(WORK, jid)
+    model_id, model = model_config(model_id)
+    NBG, SR_SCALE = model["path"], model["scale"]
+    TILE_W, TILE_H, MARGIN = model["tile_w"], model["tile_h"], model["margin"]
     shutil.rmtree(wd, ignore_errors=True)
     os.makedirs(wd, exist_ok=True)
 
@@ -407,9 +433,10 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         final_h = H * scale
         final_w = int(round(W * scale / 2)) * 2
 
-    # 最终尺寸不能超过 SR 出来的尺寸（再大也没有信息）
-    if final_h > out_h:
-        final_h, final_w = out_h, out_w
+    # 原生 x2 模型也可交付更高分辨率，但须明确后段是普通 Lanczos 放大。
+    # 保留原来的源 x4 上限；不把用户请求的 x4 静默变成 x2。
+    if final_h > H * 4:
+        final_h, final_w = H * 4, W * 4
 
     # ★VE 编码器【只会裁、不会缩】。给它 -s 3840x2160 -d 1920x1080，它交出来的不是
     #   缩小后的整帧，而是**左上角 1920x1080 那一块**（实测：单独把一张正确的 4K NV12
@@ -423,7 +450,6 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
 
     tiles_x = -(-W // (TILE_W - 2 * MARGIN))
     tiles_y = -(-H // (TILE_H - 2 * MARGIN))
-    npu_ms = W * H * 0.547 / 1000.0            # 实测 0.547 µs/源像素
 
     # 落盘的中间文件是**目标**分辨率的 NV12（缩放那一级 ffmpeg 在管道里，4K 不进盘）。
     # 分段大小按它定，把临时盘控在 ~2 GB 以内。
@@ -431,12 +457,13 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     chunk = max(10, min(CHUNK_FRAMES, int(2e9 / max(1, bytes_per_frame))))
 
     total_frames = meta["nb_frames"] or int(meta["duration"] * fps)
-    est = npu_ms * total_frames / 1000.0 if total_frames else 0
     set_job(jid, stage="准备中", meta={
+        "model": model["name"], "native_scale": SR_SCALE,
+        "preserve_bottom": preserve,
         "src": f"{W}x{H}", "sr": f"{out_w}x{out_h}",
         "final": f"{final_w}x{final_h}", "fps": round(fps, 2),
-        "tiles": f"{tiles_x}x{tiles_y}={tiles_x*tiles_y}", "npu_ms": round(npu_ms, 1),
-        "frames": total_frames, "est_npu_s": round(est, 1),
+        "tiles": f"{tiles_x}x{tiles_y}={tiles_x*tiles_y}",
+        "frames": total_frames,
     })
 
     # ---------- 可选：VE 硬解（流式，全程与超分并行）----------
@@ -478,6 +505,19 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     n_done = 0
     parts = []
     idx = 0
+
+    def recover_decoder_tail():
+        nonlocal ve
+        missing = total_frames - n_done
+        if ve and meta["nb_frames"] and 0 < missing <= 2:
+            # The vendor H.264 demo can exit before draining its last picture.
+            # Decode only this short tail in software, after releasing VE.
+            _ve_kill(jid)
+            ve = None
+            set_job(jid, stage=f"补齐硬解尾部 {missing} 帧")
+            return True
+        return False
+
     while True:
         # 本段从 n_done 帧开始
         seg = os.path.join(wd, f"seg{idx}.h264")
@@ -495,6 +535,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         # 数据量砍半：gbrp 3 字节/像素 -> NV12 1.5。
         # 锐化由 srpipe 自己做，不让开关静默失效。
         sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
+        sh_arg += f" --preserve-bottom {preserve}"
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
         gpu_arg = " --gpu" if GPU_CONV else ""
@@ -526,7 +567,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         if ds:
             cmd = (f'set -o pipefail; {head} | ffmpeg -v error -nostdin -f rawvideo '
                    f'-pix_fmt nv12 -s {out_w}x{out_h} -i - '
-                   f'-vf scale={final_w}:{final_h}:flags=area -f rawvideo -pix_fmt nv12 '
+                   f'-vf scale={final_w}:{final_h}:flags={"lanczos" if final_h > out_h else "area"} '
+                   f'-f rawvideo -pix_fmt nv12 '
                    f'-y {shq(nv12)}')
         else:
             cmd = f'set -o pipefail; {head} > {shq(nv12)}'
@@ -555,6 +597,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
             raise RuntimeError("超分段失败:\n" + (p.stderr or "")[-800:])
 
         if not os.path.exists(nv12) or os.path.getsize(nv12) < 1024:
+            if recover_decoder_tail():
+                continue
             break                                    # 没有更多帧了
 
         got = os.path.getsize(nv12) // (mid_w * mid_h * 3 // 2)   # 中间已经是目标尺寸
@@ -591,6 +635,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
         idx += 1
 
         if got < chunk:
+            if recover_decoder_tail():
+                continue
             break                                    # 源已经放完
 
     # 解码器用完就收 —— 它还挂在管道上，不收就一直占着 VE 硬件
@@ -598,6 +644,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
 
     if not parts:
         raise RuntimeError("没有产出任何编码段 —— 源视频可能读不出来")
+    if meta["nb_frames"] and n_done != total_frames:
+        raise RuntimeError(f"源视频有 {total_frames} 帧，实际只处理了 {n_done} 帧；不交付缺帧视频。")
 
     # ★产出帧数必须和源对得上，少一大截就是出了故障，【不能报「完成」】。
     #   这个闸是拿血换的：srpipe 因为不认 --in-nv12，每段都少读一半帧、
@@ -634,10 +682,13 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     #   就是 0.5 秒的累积偏移 —— 画面比声音快半秒，越到后面越明显。
     #   ffmpeg 的 -r 吃 "30000/1001" 这种写法。
     fps_r = f"{fr.numerator}/{fr.denominator}"
+    # Raw H.264's last packet otherwise keeps the parser's default 1/25 s
+    # duration, making a 45-frame / 15 fps clip report 2.9733 s and 15.135 fps.
+    ts_filter = shq(f"setts=duration={fr.denominator}/({fr.numerator}*TB)")
     dur = float(Fraction(n_done * fr.denominator, fr.numerator))   # 产物应有的时长
     if meta["has_audio"]:
         head = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
-                f'-i {shq(src)} -map 0:v:0 -map 1:a:0 -c:v copy ')
+                f'-i {shq(src)} -map 0:v:0 -map 1:a:0 -c:v copy -bsf:v {ts_filter} ')
         # ★音轨【原样复制】，不重编码：源多半已经是 aac，重编一代就多一代损失，
         #   而且这一步本来就没有需要重编的理由（视频也是 copy）。
         #   -t 精确切到产物时长。实测 150 帧的段切完仍是 150 帧，不会啃掉最后一帧。
@@ -651,7 +702,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
                         f'-y {shq(out)}'], jid=jid)
     else:
         cmd = (f'ffmpeg -v error -nostdin -f concat -safe 0 -r {fps_r} -i {shq(listf)} '
-               f'-c:v copy -y {shq(out)}')
+               f'-c:v copy -bsf:v {ts_filter} -y {shq(out)}')
         run(["bash", "-c", cmd], jid=jid)
 
     # ★产物必须自证 —— 见 check_output 的注释（单独抽成函数就为了能拿坏文件直接测）
@@ -660,6 +711,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.4):
     shutil.rmtree(wd, ignore_errors=True)
     size = os.path.getsize(out)
     set_job(jid, stage="完成", progress=100, status="done",
+            frames_done=n_done,
             out=os.path.basename(out), size=size,
             took=round(time.time() - t_start, 1),
             fps_done=round(n_done / max(0.01, time.time() - t_start), 2))
@@ -732,7 +784,7 @@ def shq(s):
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
-def worker(jid, src, scale, target_h, url, sharp=0.4):
+def worker(jid, src, scale, target_h, url, sharp=0.0, model_id=None, preserve=0.2):
     t0 = time.time()
     try:
         if url:
@@ -764,7 +816,7 @@ def worker(jid, src, scale, target_h, url, sharp=0.4):
         with _run_lock:
             if cancel_requested(jid):
                 raise Cancelled()
-            pipeline(jid, src, scale, target_h, t0, sharp)
+            pipeline(jid, src, scale, target_h, t0, sharp, model_id, preserve)
     except Cancelled:
         set_job(jid, status="cancelled", stage="已取消", progress=100,
                 error="用户取消", took=round(time.time() - t0, 1))
@@ -846,6 +898,10 @@ class H(BaseHTTPRequestHandler):
                 _sse_n[0] -= 1
 
     def do_GET(self):
+        if urlparse(self.path).path == "/api/models":
+            return self._json({"default": DEFAULT_MODEL, "models": [
+                {"id": k, "name": v["name"], "scale": v["scale"]}
+                for k, v in MODELS.items() if os.path.isfile(v["path"])]})
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path in ("/", "/index.html"):
@@ -884,7 +940,14 @@ class H(BaseHTTPRequestHandler):
             name = unquote((q.get("name") or ["input.mp4"])[0])
             scale = int((q.get("scale") or ["2"])[0])
             th = int((q.get("target") or ["0"])[0])
-            sh = float((q.get("sharp") or ["0.4"])[0])
+            sh = float((q.get("sharp") or ["0"])[0])
+            try:
+                model_id, _ = model_config((q.get("model") or [None])[0])
+                preserve = float((q.get("preserve") or ["0.2"])[0])
+                if not 0 <= preserve <= 0.5:
+                    raise ValueError("字幕保护比例应为 0..0.5")
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
             n = int(self.headers.get("Content-Length") or 0)
             if n <= 0:
                 return self._json({"error": "空文件"}, 400)
@@ -902,9 +965,9 @@ class H(BaseHTTPRequestHandler):
                 os.remove(dst)
                 return self._json({"error": "上传中断"}, 400)
             set_job(jid, status="running", stage="排队", progress=1,
-                    created=time.time(), name=name, scale=scale, target=th,
+                    created=time.time(), name=name, scale=scale, target=th, model=model_id,
                     src_mb=round(n / 1048576, 1))
-            threading.Thread(target=worker, args=(jid, dst, scale, th, None, sh),
+            threading.Thread(target=worker, args=(jid, dst, scale, th, None, sh, model_id, preserve),
                              daemon=True).start()
             return self._json({"id": jid})
 
@@ -923,16 +986,23 @@ class H(BaseHTTPRequestHandler):
             ln = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(ln) or b"{}")
             url = (body.get("url") or "").strip()
+            try:
+                model_id, _ = model_config(body.get("model"))
+                preserve = float(body.get("preserve", 0.2))
+                if not 0 <= preserve <= 0.5:
+                    raise ValueError("字幕保护比例应为 0..0.5")
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
             if not re.match(r"^https?://(www\.)?(bilibili\.com|b23\.tv)/", url):
                 return self._json({"error": "只接受 bilibili.com / b23.tv 链接"}, 400)
             jid = uuid.uuid4().hex[:12]
             set_job(jid, status="running", stage="排队", progress=1, created=time.time(),
                     name=url, scale=int(body.get("scale") or 2),
-                    target=int(body.get("target") or 0))
+                    target=int(body.get("target") or 0), model=model_id)
             threading.Thread(target=worker,
                              args=(jid, None, int(body.get("scale") or 2),
                                    int(body.get("target") or 0), url,
-                                   float(body.get("sharp", 0.4))), daemon=True).start()
+                                   float(body.get("sharp", 0)), model_id, preserve), daemon=True).start()
             return self._json({"id": jid})
 
         return self._json({"error": "not found"}, 404)
@@ -1016,7 +1086,7 @@ def main():
     sweep_old()
     SYS.start()
     print(f"A733 视频超分服务  监听 0.0.0.0:{PORT}", flush=True)
-    print(f"  NPU: {NBG}  块 {TILE_W}x{TILE_H} x{SR_SCALE} margin={MARGIN}", flush=True)
+    print(f"  默认模型: {DEFAULT_MODEL} · {MODELS[DEFAULT_MODEL]['name']}", flush=True)
     print(f"  重活钉核: {('cpu ' + ','.join(map(str, CPUS))) if CPUS else '不限制（SR_CPUSET=0 可关）'}",
           flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

@@ -5,7 +5,7 @@
  * NBG 的输入尺寸（丢信息），要么换形状重编（要重测内存池，且 640x360 x4
  * 实测会溢出 84MB 内存池 -> 输出错乱但不报错）。
  * 分块两者都不需要：源原样切块，逐块过 NPU，再拼回 4 倍大的整帧。
- * 代价仍 ∝ 源总像素（实测 0.547 µs/px），与块大小无关。
+ * 代价 = 固定形状的每块耗时 × ceil(W/core_w) × ceil(H/core_h)。
  *
  * ★数据走 stdin/stdout 管道。awnn 库里 ALOGD 就是裸 printf 会污染 stdout，
  *   所以启动时先把 fd 1 存下来，再把 stdout 重定向到 /dev/null。
@@ -15,8 +15,7 @@
  *   邻居（会看到钳制复制出来的像素），那圈输出是"少信息"的，且位置固定、
  *   每帧一样 —— 静态竖线正是人眼最敏感的。实测边界列的平均绝对差是远离边界
  *   处的 14.7 倍（2.07 vs 0.141）。
- *   修法：每块多读 margin 像素、输出只取中间有效区。代价不额外增加：
- *   640x360 源无 margin 是 2x2=4 块，margin=16 是 3x3=9 块，总处理像素都是 518K。
+ *   修法：每块多读 margin 像素、输出只取中间有效区；代价会随块数增加。
  *
  * 用法：
  *   srpipe <nbg> <in_w> <in_h> <scale> <tile_w> <tile_h>
@@ -35,7 +34,8 @@
  *      （5120x2880 时 ffmpeg 占 368% CPU，srpipe 才 45%）
  *   ③ 编码器原生就吃 NV12，可以再用 FIFO 把中间文件也省掉
  *
- *   输入 stdin ：每帧 in_w*in_h*3 字节，平面排列 R 面|G 面|B 面（= ffmpeg gbrp）
+ *   输入 stdin ：每帧 in_w*in_h*3 字节，G 面|B 面|R 面（ffmpeg gbrp）。
+ *   抠块时排成模型训练所需的 R|G|B；拼帧时再排回 G|B|R。
  *   输出 stdout：每帧 (in_w*scale)*(in_h*scale)*3 字节，同样平面排列
  *
  * 例：640x360 的源，x4，用 320x180 的块 -> 2x2=4 块/帧，出 2560x1440
@@ -56,7 +56,31 @@
 #undef time_end
 #include <pthread.h>
 #include <semaphore.h>
+#define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+
+/* Arbitrary 256-entry dequantization LUT, 16 pixels per iteration on ARM64. */
+static void lut_row(unsigned char *dst, const unsigned char *src, int n,
+                    const unsigned char *lut)
+{
+    int x = 0;
+#ifdef __aarch64__
+    uint8x16x4_t t0 = vld1q_u8_x4(lut), t1 = vld1q_u8_x4(lut + 64);
+    uint8x16x4_t t2 = vld1q_u8_x4(lut + 128), t3 = vld1q_u8_x4(lut + 192);
+    for (; x + 16 <= n; x += 16) {
+        uint8x16_t i = vld1q_u8(src + x);
+        uint8x16_t a = vqtbl4q_u8(t0, i);
+        uint8x16_t b = vqtbl4q_u8(t1, vsubq_u8(i, vdupq_n_u8(64)));
+        uint8x16_t c = vqtbl4q_u8(t2, vsubq_u8(i, vdupq_n_u8(128)));
+        uint8x16_t d = vqtbl4q_u8(t3, vsubq_u8(i, vdupq_n_u8(192)));
+        vst1q_u8(dst + x, vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d)));
+    }
+#endif
+    for (; x < n; x++) dst[x] = lut[src[x]];
+}
 
 #define CL_CHECK_OR_DIE(e, what) do { if ((e) != CL_SUCCESS) { \
     fprintf(stderr, "OpenCL 错误 %d @ %s\n", (int)(e), what); exit(1); } } while (0)
@@ -118,6 +142,56 @@ static const char *CL_SRC =
 "    Y[c] = (uchar)(v < 16 ? 16 : (v > 235 ? 235 : v));\n"
 "}\n";
 
+/* Preserve source luminance in an explicit bottom band. This is interpolation,
+ * not OCR: it cannot invent/change glyph strokes. Chroma still comes from SR. */
+static const char *CL_TEXT_SRC =
+"int sy_at(__global const uchar *s,int x,int y,int iw,int ih,int in_h,int nv) {\n"
+"#if INPUT_NV12\n"
+"  return clamp((int)s[y*iw+x],16,235);\n"
+"#else\n"
+"  int p=iw*ih,i=y*iw+x;\n"
+"  return clamp(((16829*(int)s[2*p+i]+33039*(int)s[i]+6416*(int)s[p+i])>>16)+16,16,235);\n"
+"#endif\n"
+"}\n"
+"__kernel void preserve_y(__global uchar *Y,__global const uchar *s,\n"
+"  int iw,int ih,int in_h,int nv,int w,int h,int scale,int start) {\n"
+"  int x=get_global_id(0),y=start+get_global_id(1);\n"
+"  if(x>=w || y>=h) return;\n"
+"  int xx=clamp(((2*x+1)*128)/scale-128,0,(iw-1)*256);\n"
+"  int yy=clamp(((2*y+1)*128)/scale-128,0,(ih-1)*256);\n"
+"  int x0=xx>>8,y0=yy>>8,x1=min(x0+1,iw-1),y1=min(y0+1,ih-1);\n"
+"  int fx=xx&255,fy=yy&255;\n"
+"  int a=sy_at(s,x0,y0,iw,ih,in_h,nv)*(256-fx)+sy_at(s,x1,y0,iw,ih,in_h,nv)*fx;\n"
+"  int b=sy_at(s,x0,y1,iw,ih,in_h,nv)*(256-fx)+sy_at(s,x1,y1,iw,ih,in_h,nv)*fx;\n"
+"  int v=(a*(256-fy)+b*fy+32768)>>16;\n"
+"  int alpha=min(256,(y-start)*256/(4*scale));\n"
+"  int i=y*w+x; Y[i]=(uchar)((v*alpha+(int)Y[i]*(256-alpha)+128)>>8);\n"
+"}\n";
+
+static int source_y(const unsigned char *s,int x,int y,int iw,int ih,int nv)
+{
+    int p=iw*ih, i=y*iw+x;
+    int v=nv ? s[i] : ((16829*s[2*p+i]+33039*s[i]+6416*s[p+i])>>16)+16;
+    return v<16 ? 16 : (v>235 ? 235 : v);
+}
+
+static void preserve_y_cpu(unsigned char *Y,const unsigned char *s,int iw,int ih,
+                           int nv,int w,int h,int scale,int start)
+{
+    for(int y=start;y<h;y++) for(int x=0;x<w;x++) {
+        int xx=((2*x+1)*128)/scale-128, yy=((2*y+1)*128)/scale-128;
+        if(xx<0) xx=0; if(xx>(iw-1)*256) xx=(iw-1)*256;
+        if(yy<0) yy=0; if(yy>(ih-1)*256) yy=(ih-1)*256;
+        int x0=xx>>8,y0=yy>>8,x1=x0+1<iw ? x0+1 : iw-1,y1=y0+1<ih ? y0+1 : ih-1;
+        int fx=xx&255,fy=yy&255;
+        int a=source_y(s,x0,y0,iw,ih,nv)*(256-fx)+source_y(s,x1,y0,iw,ih,nv)*fx;
+        int b=source_y(s,x0,y1,iw,ih,nv)*(256-fx)+source_y(s,x1,y1,iw,ih,nv)*fx;
+        int v=(a*(256-fy)+b*fy+32768)>>16;
+        int alpha=(y-start)*256/(4*scale); if(alpha>256) alpha=256;
+        int i=y*w+x; Y[i]=(unsigned char)((v*alpha+Y[i]*(256-alpha)+128)>>8);
+    }
+}
+
 /* ---- 输入侧：把整帧 gbrp「抠」成 NPU 要的瓦片布局 ----
  * 纯数据搬运，不做任何数值变换 —— 所以能和 CPU 路径【逐字节】比对，
  * 这是这条流水线里唯一一处可以做到完全等价验证的地方。
@@ -126,7 +200,7 @@ static const char *CL_SRC =
  * （16 块 x 3 平面 x 180 行），实测比它搬运的数据量该有的时间贵几十倍，
  * 而 CPU 正是 60°C 就降到 416MHz 的那个热区。
  *
- * 输出布局：tiles[(ty*nx+tx)][plane][y][x]，plane 顺序 G,B,R（与 gbrp 一致）。
+ * 输出布局：tiles[(ty*nx+tx)][plane][y][x]，plane 顺序 R,G,B（模型输入）。
  */
 static const char *CL_IN_SRC =
 "__kernel void frame_to_tiles(__global const uchar *G, __global const uchar *B,\n"
@@ -144,9 +218,9 @@ static const char *CL_IN_SRC =
 "    if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;\n"
 "    int i = sy * iw + sx, o = ly * tw + lx, plane = tw * th;\n"
 "    __global uchar *base = T + (size_t)(ty * nx + tx) * 3 * plane;\n"
-"    base[o]            = G[i];\n"
-"    base[plane + o]    = B[i];\n"
-"    base[2 * plane + o]= R[i];\n"
+"    base[o]            = R[i];\n"
+"    base[plane + o]    = G[i];\n"
+"    base[2 * plane + o]= B[i];\n"
 "}\n";
 
 /* --- GPU 线程的共享状态（双缓冲）--- */
@@ -163,6 +237,11 @@ typedef struct {
     volatile long frames;
     volatile long posted;         /* 生产者交出去的帧数，用来排空后再停 */
     int data_fd;                  /* GPU 线程负责写输出 */
+    int iw, ih, in_h, nv, scale, text_start;
+    size_t source_bytes;
+    unsigned char *source[2];
+    cl_mem mSource;
+    cl_kernel k_text;
 } gpu_ctx_t;
 
 static void *gpu_thread(void *arg)
@@ -195,6 +274,13 @@ static void *gpu_thread(void *arg)
             if (ls1[1] > gs1[1]) ls1[1] = gs1[1];
             clEnqueueNDRangeKernel(g->q, g->k_sh, 2, NULL, gs1, ls1, 0, NULL, NULL);
         }
+        if (g->k_text) {
+            CL_CHECK_OR_DIE(clEnqueueWriteBuffer(g->q,g->mSource,CL_TRUE,0,
+                g->source_bytes,g->source[i],0,NULL,NULL),"text source");
+            size_t text_size[2]={(size_t)g->w,(size_t)(g->h-g->text_start)};
+            CL_CHECK_OR_DIE(clEnqueueNDRangeKernel(g->q,g->k_text,2,NULL,
+                text_size,NULL,0,NULL,NULL),"preserve_y");
+        }
         /* ★Y 和 UV 是两个 buffer，必须分别读回来、拼进 NV12 的两段。
          *   我第一版只读了 mY 却按整个 yuv 尺寸读 —— UV 那半截是未初始化内存，
          *   表现成"Y 平面逐字节相同、UV 全错"（实测 UV 平均差 128）。 */
@@ -204,11 +290,9 @@ static void *gpu_thread(void *arg)
 
         clock_gettime(CLOCK_MONOTONIC, &ts);
         g->t_conv += (ts.tv_sec * 1e3 + ts.tv_nsec / 1e6) - t0;
-        g->frames++;
-        if (!g->stop) {
-            write_full(g->data_fd, g->yuv[i], yuv);
-            fprintf(stderr, "FRAME %ld\n", g->frames - 1);
-        }
+        write_full(g->data_fd, g->yuv[i], yuv);
+        fprintf(stderr, "FRAME %ld\n", g->frames);
+        g->frames++;  /* Producer may stop us only after the frame is written. */
         g->idx_out ^= 1;
         sem_post(&g->empty);
     }
@@ -259,7 +343,8 @@ static void *gpu_in_thread(void *arg)
         const unsigned char *s = g->src[i];
         if (g->in_nv12) {
             e  = clEnqueueWriteBuffer(g->q, g->mY,  CL_TRUE, 0, px,     s,        0, NULL, NULL);
-            e |= clEnqueueWriteBuffer(g->q, g->mUV, CL_TRUE, 0, px / 2, s + px,   0, NULL, NULL);
+            e |= clEnqueueWriteBuffer(g->q, g->mUV, CL_TRUE, 0, px / 2,
+                                     s + (size_t)g->iw * g->in_h, 0, NULL, NULL);
             if (e != CL_SUCCESS) { fprintf(stderr, "srpipe: GPU 上传失败 %d\n", (int)e); exit(1); }
             size_t gsz[2] = { (size_t)g->nx * g->tw, (size_t)g->ny * g->th };
             clEnqueueNDRangeKernel(g->q, g->k_nv12, 2, NULL, gsz, NULL, 0, NULL, NULL);
@@ -286,7 +371,7 @@ static void *gpu_in_thread(void *arg)
 /* NV12 版同一件事：一趟做完 NV12 -> RGB + 排成瓦片。
  *
  * 为什么需要它：VE 硬解吐出来的就是 NV12（用 vdecoderdemo 整片 dump，见 app.py），
- * 而 NPU 要的是 G,B,R 平面瓦片。中间那步 ffmpeg 的 yuv->gbrp 是纯 CPU 开销，
+ * 而 NPU 要的是 R,G,B 平面瓦片。中间那步 ffmpeg 的 yuv->gbrp 是纯 CPU 开销，
  * 直接在这里做掉。
  *
  * ★色度是【最近邻】上采样（每个像素取它 2x2 块的那对 UV）。ffmpeg 的 swscale
@@ -319,9 +404,9 @@ static const char *CL_IN_NV12_SRC =
 "    b = b < 0 ? 0 : (b > 255 ? 255 : b);\n"
 "    int o = ly * tw + lx, plane = tw * th;\n"
 "    __global uchar *base = T + (size_t)(ty * nx + tx) * 3 * plane;\n"
-"    base[o]             = (uchar)g;\n"
-"    base[plane + o]     = (uchar)b;\n"
-"    base[2 * plane + o] = (uchar)r;\n"
+"    base[o]             = (uchar)r;\n"
+"    base[plane + o]     = (uchar)g;\n"
+"    base[2 * plane + o] = (uchar)b;\n"
 "}\n";
 
 /* CPU 版同一件事 —— 保留它是为了能逐字节验证 GPU 路径（见 tools/gputiletest.sh） */
@@ -336,7 +421,8 @@ static void gather_cpu(const unsigned char *fin, unsigned char *tiles, const gin
             unsigned char *blk = tiles + (size_t)(ty * g->nx + tx) * 3 * plane;
             for (int c = 0; c < 3; c++) {
                 const unsigned char *src = fin + (size_t)c * g->iw * g->ih;
-                unsigned char *dst = blk + (size_t)c * plane;
+                /* ffmpeg is GBR; the trained model expects RGB. */
+                unsigned char *dst = blk + (size_t)((c + 1) % 3) * plane;
                 for (int y = 0; y < g->th; y++) {
                     int sy = y0 + y;
                     if (sy < 0) sy = 0; else if (sy >= g->ih) sy = g->ih - 1;
@@ -367,7 +453,7 @@ static void gather_nv12_cpu(const unsigned char *fin, unsigned char *tiles, cons
         for (int tx = 0; tx < g->nx; tx++) {
             const int x0 = tx * g->cw - g->margin, y0 = ty * g->ch - g->margin;
             unsigned char *blk = tiles + (size_t)(ty * g->nx + tx) * 3 * plane;
-            unsigned char *G = blk, *B = blk + plane, *R = blk + 2 * plane;
+            unsigned char *R = blk, *G = blk + plane, *B = blk + 2 * plane;
             for (int y = 0; y < g->th; y++) {
                 int sy = y0 + y;
                 if (sy < 0) sy = 0; else if (sy >= g->ih) sy = g->ih - 1;
@@ -432,6 +518,7 @@ int main(int argc, char **argv)
             "  --margin N         块间重叠圈\n"
             "  --nv12             输出 NV12\n"
             "  --sharpen F        锐化强度\n"
+            "  --preserve-bottom F 底部区域亮度保真，0..0.5，需要 --nv12\n"
             "  --gpu / --gpu-in   GPU 做输出转换 / GPU 抠块\n"
             "  --profile          打印各阶段耗时\n", argv[0]);
         return 2;
@@ -441,6 +528,7 @@ int main(int argc, char **argv)
     int tw = atoi(argv[5]), th = atoi(argv[6]);
     int margin = 0, out_nv12 = 0;
     float sharpen = 0.0f;
+    float preserve_bottom = 0.0f;
     int profile = 0, use_gpu = 0, use_gpu_in = 0, in_nv12 = 0;
     const char *dump_tiles = NULL;
     int force_float = 0;
@@ -452,14 +540,18 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--in-h") && i + 1 < argc) in_h = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atol(argv[++i]);
         else if (!strcmp(argv[i], "--sharpen") && i + 1 < argc) sharpen = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--preserve-bottom") && i + 1 < argc) preserve_bottom = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--gpu-in")) use_gpu_in = 1;
         else if (!strcmp(argv[i], "--in-nv12")) in_nv12 = 1;
         else if (!strcmp(argv[i], "--float-out")) force_float = 1;   /* A/B 用：强制走 awnn 浮点路 */
         else if (!strcmp(argv[i], "--dump-tiles") && i + 1 < argc) dump_tiles = argv[++i];
+        else die("未知选项或选项缺少参数");
     }
     if (sharpen < 0.0f) sharpen = 0.0f;
+    if (!(preserve_bottom >= 0.0f && preserve_bottom <= 0.5f)) die("字幕保护比例应为 0..0.5");
+    if (preserve_bottom > 0 && !out_nv12) die("字幕保护需要 --nv12");
     if (iw <= 0 || ih <= 0 || scale <= 0 || tw <= 0 || th <= 0) die("参数不合法");
     if (margin < 0) margin = 0;
     if (2 * margin >= tw || 2 * margin >= th) die("margin 太大了");
@@ -505,8 +597,6 @@ int main(int argc, char **argv)
     /* --gpu-in 的内核把 UV 平面写死在 Y 之后（偏移 iw*ih），缓冲区也按 iw*ih 分配，
      * 装不下 in_h > ih 的输入。这条路本来就默认关、实测也没用（弱 GPU），
      * 与其去改内核，不如直接拒绝这个组合。 */
-    if (use_gpu_in && in_h != ih)
-        die("--gpu-in 不支持 --in-h（输入缓冲区高 != 裁剪高）；用 CPU 抠块那条路");
     gin.frame_in = frame_in; gin.tile_in = tile_in; gin.all_tiles = all_tiles;
     gin.slot_in = 0; gin.slot_out = 0; gin.stop = 0; gin.posted = 0; gin.done = 0;
     pthread_t gin_tid = 0;
@@ -591,6 +681,17 @@ int main(int argc, char **argv)
     awnn_init();
     Awnn_Context_t *ctx = awnn_create(nbg);
     if (!ctx) die("awnn_create 失败");
+    if (ctx->input_count != 1 || ctx->output_count != 1 ||
+        ctx->input_params[0].vip_param.data_format != VIP_BUFFER_FORMAT_UINT8 ||
+        ctx->input_params[0].vip_param.sizes[0] != (unsigned)tw ||
+        ctx->input_params[0].vip_param.sizes[1] != (unsigned)th ||
+        ctx->input_params[0].vip_param.sizes[2] != 3 ||
+        ctx->input_params[0].elements != tile_in ||
+        ctx->output_params[0].vip_param.sizes[0] != (unsigned)stw ||
+        ctx->output_params[0].vip_param.sizes[1] != (unsigned)sth ||
+        ctx->output_params[0].vip_param.sizes[2] != 3 ||
+        ctx->output_params[0].elements != tile_out_bytes)
+        die("NBG 输入/输出形状与块尺寸或倍率不匹配");
 
     /* ★★ 绕开 awnn_run 的浮点反量化。
      *
@@ -647,17 +748,41 @@ int main(int argc, char **argv)
         }
         gpu.k    = clCreateKernel(pr, "gbrp2nv12_sharp", &e);
         gpu.k_sh = clCreateKernel(pr, "unsharp_y", &e);
+        clReleaseProgram(pr);  /* Kernels retain it; release before driver teardown. */
+        if (preserve_bottom > 0) {
+            gpu.iw=iw; gpu.ih=ih; gpu.in_h=in_h; gpu.nv=in_nv12; gpu.scale=scale;
+            gpu.text_start=(int)(oh*(1.0f-preserve_bottom));
+            gpu.source_bytes=frame_in;
+            for(int i=0;i<2;i++) {
+                gpu.source[i]=(unsigned char*)malloc(frame_in);
+                if(!gpu.source[i]) die("字幕保护源帧 malloc 失败");
+            }
+            gpu.mSource=clCreateBuffer(gpu.ctx,CL_MEM_READ_ONLY,frame_in,NULL,&e);
+            CL_CHECK_OR_DIE(e,"text buffer");
+        }
         for (int i = 0; i < 2; i++) {
             gpu.rgb[i] = (unsigned char *)malloc(rgb_bytes);
             gpu.yuv[i] = (unsigned char *)malloc(frame_out);
             if (!gpu.rgb[i] || !gpu.yuv[i]) die("GPU 双缓冲 malloc 失败");
         }
-        gpu.mG  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  rgb_bytes, NULL, &e);
-        gpu.mB  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  rgb_bytes, NULL, &e);
-        gpu.mR  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  rgb_bytes, NULL, &e);
-        gpu.mY  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, frame_out, NULL, &e);
+        gpu.mG  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
+        gpu.mB  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
+        gpu.mR  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
+        gpu.mY  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, (size_t)ow * oh, NULL, &e);
         gpu.mYT = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, (size_t)ow * oh, NULL, &e);
-        gpu.mUV = clCreateBuffer(gpu.ctx, CL_MEM_WRITE_ONLY, frame_out, NULL, &e);
+        gpu.mUV = clCreateBuffer(gpu.ctx, CL_MEM_WRITE_ONLY, (size_t)ow * oh / 2, NULL, &e);
+        if (preserve_bottom > 0) {
+            cl_program tp=clCreateProgramWithSource(gpu.ctx,1,&CL_TEXT_SRC,NULL,&e);
+            CL_CHECK_OR_DIE(clBuildProgram(tp,1,&dev,
+                in_nv12 ? "-DINPUT_NV12=1" : "-DINPUT_NV12=0",NULL,NULL),"text program");
+            gpu.k_text=clCreateKernel(tp,"preserve_y",&e);
+            CL_CHECK_OR_DIE(e,"text kernel");
+            CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,0,sizeof(cl_mem),&gpu.mY),"text Y");
+            CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,1,sizeof(cl_mem),&gpu.mSource),"text src");
+            int args[]={iw,ih,in_h,in_nv12,ow,oh,scale,gpu.text_start};
+            for(int a=0;a<8;a++) CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,a+2,sizeof(int),&args[a]),"text arg");
+            clReleaseProgram(tp);
+        }
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 0, sizeof(cl_mem), &gpu.mG), "argG");
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 1, sizeof(cl_mem), &gpu.mB), "argB");
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 2, sizeof(cl_mem), &gpu.mR), "argR");
@@ -751,14 +876,15 @@ int main(int argc, char **argv)
                     const unsigned char *q = qbuf;
                     for (int c = 0; c < 3; c++) {
                         const unsigned char *sp = q + (size_t)c * stw * sth;
-                        unsigned char *dstf = fout + (size_t)c * ow * oh;
+                        /* Model RGB -> ffmpeg/GPU GBR, without another frame copy. */
+                        unsigned char *dstf = fout + (size_t)((c + 2) % 3) * ow * oh;
                         for (int y = 0; y < sch; y++) {
                             int oy = ty * sch + y;
                             if (oy >= oh) break;
                             unsigned char *row = dstf + (size_t)oy * ow + tx * scw;
                             const unsigned char *srow = sp + (size_t)(y + margin * scale) * stw
                                                            + margin * scale;
-                            for (int x = 0; x < lim; x++) row[x] = lut[srow[x]];
+                            lut_row(row, srow, lim, lut);
                         }
                     }
                 } else {
@@ -770,7 +896,7 @@ int main(int argc, char **argv)
                     const float *f = out[0];
                     for (int c = 0; c < 3; c++) {
                         const float *src = f + (size_t)c * stw * sth;
-                        unsigned char *dstf = fout + (size_t)c * ow * oh;
+                        unsigned char *dstf = fout + (size_t)((c + 2) % 3) * ow * oh;
                         for (int y = 0; y < sch; y++) {
                             int oy = ty * sch + y;
                             if (oy >= oh) break;
@@ -796,6 +922,8 @@ int main(int argc, char **argv)
             /* 把刚拼好的整帧交给 GPU 线程，自己不转 —— NPU 立刻去啃下一帧 */
             sem_wait(&gpu.empty);
             memcpy(gpu.rgb[gpu.idx_in], fout, rgb_bytes);
+            if(gpu.k_text) memcpy(gpu.source[gpu.idx_in],
+                use_gpu_in ? gin.src[gin.slot_in] : fin,frame_in);
             gpu.idx_in ^= 1;
             gpu.posted++;
             sem_post(&gpu.full);
@@ -806,7 +934,7 @@ int main(int argc, char **argv)
              * ★平面顺序是 G, B, R —— 不是 R, G, B！
              * 这是从数据里回归出来的：拿 ffmpeg 的 gbrp->nv12 当参考做最小二乘，
              * 拟合系数正好是 BT.601 的系数按 (R,G,B)->(G,B,R) 置换。
-             * 也正因为 NPU 的输出顺序恰好就是 gbrp 的定义，整条流水线才对得上。
+             * NPU 原始输出是 RGB，已在拼帧时重排成此处的 GBR。
              * 之前按 R,G,B 读，往返误差 7.18；改对之后应降到 <1。
              *
              * 色度 2x2 平均必须在整帧而不是每块里做 —— 2x2 块会跨块边界。 */
@@ -876,12 +1004,15 @@ int main(int argc, char **argv)
                 }
             }
             t_sh += _ms()-_t0; _t0=_ms();
+            if(preserve_bottom>0) preserve_y_cpu(yuv,
+                use_gpu_in ? gin.src[gin.slot_in] : fin,iw,ih,in_nv12,ow,oh,
+                scale,(int)(oh*(1.0f-preserve_bottom)));
             write_full(data_fd, yuv, frame_out);
             t_wr += _ms()-_t0;
         } else {
             write_full(data_fd, fout, rgb_bytes);
         }
-        fprintf(stderr, "FRAME %ld\n", frame);
+        if (!use_gpu) fprintf(stderr, "FRAME %ld\n", frame);
         frame++;
     }
 
@@ -899,6 +1030,16 @@ int main(int argc, char **argv)
         gpu.stop = 1;
         sem_post(&gpu.full);            /* 唤醒它去看到 stop */
         pthread_join(gpu_tid, NULL);
+        clFinish(gpu.q);
+        if(gpu.k_text) {
+            clReleaseKernel(gpu.k_text);
+            clReleaseMemObject(gpu.mSource);
+            for(int i=0;i<2;i++) free(gpu.source[i]);
+        }
+        clReleaseKernel(gpu.k); clReleaseKernel(gpu.k_sh);
+        clReleaseMemObject(gpu.mG); clReleaseMemObject(gpu.mB); clReleaseMemObject(gpu.mR);
+        clReleaseMemObject(gpu.mY); clReleaseMemObject(gpu.mYT); clReleaseMemObject(gpu.mUV);
+        clReleaseCommandQueue(gpu.q); clReleaseContext(gpu.ctx);
     }
     awnn_destroy(ctx);
     awnn_uninit();
@@ -911,7 +1052,7 @@ int main(int argc, char **argv)
                 gpu.frames, gpu.t_conv, gpu.frames ? gpu.t_conv / gpu.frames : 0);
     if (profile && frame > 0) {
         double tot=t_read+t_tile+t_npu+t_asm+t_yuv+t_sh+t_wr;
-        fprintf(stderr, "PROFILE %ld 帧  每帧 ms: 读入%.1f %s%.1f NPU(含去量化)%.1f "
+        fprintf(stderr, "PROFILE %ld 帧  每帧 ms: 读入%.1f %s%.1f NPU%.1f "
                         "拼帧%.1f RGB->NV12 %.1f 锐化%.1f 写出%.1f | 合计%.1f\n",
                 frame, t_read/frame, use_gpu_in ? "等GPU抠块" : "抠块", t_tile/frame,
                 t_npu/frame, t_asm/frame, t_yuv/frame, t_sh/frame, t_wr/frame, tot/frame);
