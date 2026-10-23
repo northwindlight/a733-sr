@@ -106,6 +106,15 @@ def model_config(model_id=None):
         raise ValueError("该模型尚未安装")
     return model_id, m
 
+
+def parse_strength(value):
+    if value is None or value == "" or value == "auto":
+        return None
+    strength = float(value)
+    if not 0 <= strength <= 1:
+        raise ValueError("AI 强度应为 0..1 或 auto")
+    return strength
+
 PORT = int(os.environ.get("SR_PORT", "8080"))
 
 os.makedirs(DATA, exist_ok=True)
@@ -352,6 +361,8 @@ def probe(path):
         "duration": float(info["format"].get("duration") or 0),
         "nb_frames": int(v.get("nb_frames") or 0),
         "codec": v.get("codec_name") or "",
+        "color_space": v.get("color_space") or "unknown",
+        "video_bit_rate": int(v.get("bit_rate") or 0),
     }
 
 
@@ -402,7 +413,7 @@ def npu_env():
     return e
 
 
-def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, preserve=0.2):
+def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, preserve=0.2, strength=None):
     """
     scale    : 用户选的"超分倍率" 2 或 4 —— 只影响最终输出尺寸，不影响 NPU 代价
     target_h : 用户选的最终高度（0 = 自动 = 源高 * scale）
@@ -417,6 +428,10 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, prese
     set_job(jid, stage="探测源视频", progress=8)
     meta = probe(src)
     W, H = meta["w"], meta["h"]
+    strength = parse_strength(strength)
+    if strength is None:
+        strength = 0.35 if H >= 720 else 1.0
+    input_matrix = "bt709" if meta["color_space"] == "bt709" else "bt601"
     fps = meta["fps"] or 30.0
     # 精确帧率（有理数）。ffprobe 给不出有效值时才退回按毫秒近似的那个。
     # ★这是"音画对准"的基准：产物时长必须是 帧数 / 这个值，音频也按它切。
@@ -460,6 +475,9 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, prese
     set_job(jid, stage="准备中", meta={
         "model": model["name"], "native_scale": SR_SCALE,
         "preserve_bottom": preserve,
+        "strength": strength, "sharp": sharp,
+        "input_matrix": input_matrix, "output_matrix": "bt709",
+        "src_codec": meta["codec"], "src_video_bit_rate": meta["video_bit_rate"],
         "src": f"{W}x{H}", "sr": f"{out_w}x{out_h}",
         "final": f"{final_w}x{final_h}", "fps": round(fps, 2),
         "tiles": f"{tiles_x}x{tiles_y}={tiles_x*tiles_y}",
@@ -536,6 +554,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, prese
         # 锐化由 srpipe 自己做，不让开关静默失效。
         sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
         sh_arg += f" --preserve-bottom {preserve}"
+        sh_arg += f" --strength {strength} --input-matrix {input_matrix} --output-matrix bt709"
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
         gpu_arg = " --gpu" if GPU_CONV else ""
@@ -784,7 +803,7 @@ def shq(s):
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
-def worker(jid, src, scale, target_h, url, sharp=0.0, model_id=None, preserve=0.2):
+def worker(jid, src, scale, target_h, url, sharp=0.0, model_id=None, preserve=0.2, strength=None):
     t0 = time.time()
     try:
         if url:
@@ -816,7 +835,7 @@ def worker(jid, src, scale, target_h, url, sharp=0.0, model_id=None, preserve=0.
         with _run_lock:
             if cancel_requested(jid):
                 raise Cancelled()
-            pipeline(jid, src, scale, target_h, t0, sharp, model_id, preserve)
+            pipeline(jid, src, scale, target_h, t0, sharp, model_id, preserve, strength)
     except Cancelled:
         set_job(jid, status="cancelled", stage="已取消", progress=100,
                 error="用户取消", took=round(time.time() - t0, 1))
@@ -943,6 +962,7 @@ class H(BaseHTTPRequestHandler):
             sh = float((q.get("sharp") or ["0"])[0])
             try:
                 model_id, _ = model_config((q.get("model") or [None])[0])
+                strength = parse_strength((q.get("strength") or ["auto"])[0])
                 preserve = float((q.get("preserve") or ["0.2"])[0])
                 if not 0 <= preserve <= 0.5:
                     raise ValueError("字幕保护比例应为 0..0.5")
@@ -967,7 +987,7 @@ class H(BaseHTTPRequestHandler):
             set_job(jid, status="running", stage="排队", progress=1,
                     created=time.time(), name=name, scale=scale, target=th, model=model_id,
                     src_mb=round(n / 1048576, 1))
-            threading.Thread(target=worker, args=(jid, dst, scale, th, None, sh, model_id, preserve),
+            threading.Thread(target=worker, args=(jid, dst, scale, th, None, sh, model_id, preserve, strength),
                              daemon=True).start()
             return self._json({"id": jid})
 
@@ -988,6 +1008,7 @@ class H(BaseHTTPRequestHandler):
             url = (body.get("url") or "").strip()
             try:
                 model_id, _ = model_config(body.get("model"))
+                strength = parse_strength(body.get("strength"))
                 preserve = float(body.get("preserve", 0.2))
                 if not 0 <= preserve <= 0.5:
                     raise ValueError("字幕保护比例应为 0..0.5")
@@ -1002,7 +1023,7 @@ class H(BaseHTTPRequestHandler):
             threading.Thread(target=worker,
                              args=(jid, None, int(body.get("scale") or 2),
                                    int(body.get("target") or 0), url,
-                                   float(body.get("sharp", 0)), model_id, preserve), daemon=True).start()
+                                   float(body.get("sharp", 0)), model_id, preserve, strength), daemon=True).start()
             return self._json({"id": jid})
 
         return self._json({"error": "not found"}, 404)

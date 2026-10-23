@@ -156,6 +156,16 @@
     </div>
     <div style="color:var(--dim);font-size:12px;margin:0 0 12px" id="modelNote"></div>
     <div class="fields">
+      <label>AI 强度</label>
+      <select id="strength">
+        <option value="auto" selected>自动（推荐）</option>
+        <option value="0.35">35% · 保留原片纹理</option>
+        <option value="0.65">65% · 平衡</option>
+        <option value="1">100% · 完整模型输出</option>
+      </select>
+    </div>
+    <div style="color:var(--dim);font-size:12px;margin:0 0 12px">MMD 或画面有涂抹感时可降低 AI 强度。自动对 720p 及以上使用 35%，更低分辨率使用 100%。</div>
+    <div class="fields">
       <label>字幕保护</label>
       <select id="preserve">
         <option value="0.2" selected>底部 20%（推荐）</option>
@@ -465,7 +475,7 @@ async function upload(file){
   const fd = new FormData();
   const q = new URLSearchParams(Object.assign(
     {name: file.name, sharp: $('#sharp').value, model: $('#model').value,
-     preserve:$('#preserve').value}, readRes()));
+     preserve:$('#preserve').value, strength:$('#strength').value}, readRes()));
   setBusy(true);
   const xhr = new XMLHttpRequest();      // 用 XHR 才有上传进度
   xhr.open('POST', '/api/upload?' + q);
@@ -489,7 +499,7 @@ async function viaUrl(){
   const r = await (await fetch('/api/url', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify(Object.assign({url, sharp:+$('#sharp').value, model:$('#model').value,
-                                         preserve:+$('#preserve').value}, readRes()))})).json();
+                                         preserve:+$('#preserve').value, strength:$('#strength').value}, readRes()))})).json();
   setBusy(false);
   if(r.id) start(r.id); else alert(r.error || '失败');
 }
@@ -544,6 +554,7 @@ function render(){
       ${j.meta ? `<span>源 ${esc(j.meta.src)}</span>
                   <span>输出 <b>${esc(j.meta.final)}</b></span>
                   ${j.meta.model ? `<span>${esc(j.meta.model)}</span>` : ''}
+                  ${j.meta.strength != null ? `<span>AI 强度 ${Math.round(j.meta.strength*100)}%</span>` : ''}
                   <span>${j.meta.tiles} 块/帧</span>` : ''}
       ${j.size ? `<span class="num">${(j.size/1048576).toFixed(1)} MB</span>` : ''}
       ${j.took ? `<span class="num">耗时 ${j.took}s</span>` : ''}

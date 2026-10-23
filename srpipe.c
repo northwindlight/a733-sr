@@ -58,6 +58,7 @@
 #include <semaphore.h>
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#include "srcolour.h"
 #ifdef __aarch64__
 #include <arm_neon.h>
 #endif
@@ -113,13 +114,22 @@ static const char *CL_SRC =
 "            int i = yy * w + xx;\n"
 "            int r = R[i], g = G[i], b = B[i];\n"
 "            sr += r; sg += g; sb += b;\n"
+"#if OUT_BT709\n"
+"            int v = ((11966*r+40254*g+4064*b)>>16)+16;\n"
+"#else\n"
 "            int v = ((16829 * r + 33039 * g + 6416 * b) >> 16) + 16;\n"
+"#endif\n"
 "            Y[i] = (uchar)(v < 16 ? 16 : (v > 235 ? 235 : v));\n"
 "        }\n"
 "    }\n"
 "    int r = sr / 4, g = sg / 4, b = sb / 4;\n"
+"#if OUT_BT709\n"
+"    int cb=((-6596*r-22188*g+28784*b)>>16)+128;\n"
+"    int cr=((28784*r-26145*g-2639*b)>>16)+128;\n"
+"#else\n"
 "    int cb = ((-9711 * r - 19098 * g + 28784 * b) >> 16) + 128;\n"
 "    int cr = (( 28784 * r - 24103 * g - 4681 * b) >> 16) + 128;\n"
+"#endif\n"
 "    cb = cb < 16 ? 16 : (cb > 240 ? 240 : cb);\n"
 "    cr = cr < 16 ? 16 : (cr > 240 ? 240 : cr);\n"
 "    int o = (by / 2) * w + bx;\n"
@@ -147,10 +157,15 @@ static const char *CL_SRC =
 static const char *CL_TEXT_SRC =
 "int sy_at(__global const uchar *s,int x,int y,int iw,int ih,int in_h,int nv) {\n"
 "#if INPUT_NV12\n"
+"#if IN_BT709 == OUT_BT709\n"
 "  return clamp((int)s[y*iw+x],16,235);\n"
+"#endif\n"
+"#endif\n"
+"  int3 rgb=sr_source_rgb(s,x,y,iw,ih,in_h);\n"
+"#if OUT_BT709\n"
+"  return clamp(((11966*rgb.x+40254*rgb.y+4064*rgb.z)>>16)+16,16,235);\n"
 "#else\n"
-"  int p=iw*ih,i=y*iw+x;\n"
-"  return clamp(((16829*(int)s[2*p+i]+33039*(int)s[i]+6416*(int)s[p+i])>>16)+16,16,235);\n"
+"  return clamp(((16829*rgb.x+33039*rgb.y+6416*rgb.z)>>16)+16,16,235);\n"
 "#endif\n"
 "}\n"
 "__kernel void preserve_y(__global uchar *Y,__global const uchar *s,\n"
@@ -168,15 +183,17 @@ static const char *CL_TEXT_SRC =
 "  int i=y*w+x; Y[i]=(uchar)((v*alpha+(int)Y[i]*(256-alpha)+128)>>8);\n"
 "}\n";
 
-static int source_y(const unsigned char *s,int x,int y,int iw,int ih,int nv)
+static int source_y(const unsigned char *s,int x,int y,int iw,int ih,int in_h,int nv,int in709,int out709)
 {
-    int p=iw*ih, i=y*iw+x;
-    int v=nv ? s[i] : ((16829*s[2*p+i]+33039*s[i]+6416*s[p+i])>>16)+16;
+    if(nv && in709==out709) return sr_clip(s[y*iw+x],16,235);
+    int rgb[3];sr_source_rgb(s,x,y,iw,ih,in_h,nv,in709,rgb);
+    int v=out709 ? ((11966*rgb[0]+40254*rgb[1]+4064*rgb[2])>>16)+16 :
+                  ((16829*rgb[0]+33039*rgb[1]+6416*rgb[2])>>16)+16;
     return v<16 ? 16 : (v>235 ? 235 : v);
 }
 
-static void preserve_y_cpu(unsigned char *Y,const unsigned char *s,int iw,int ih,
-                           int nv,int w,int h,int scale,int start)
+static void preserve_y_cpu(unsigned char *Y,const unsigned char *s,int iw,int ih,int in_h,
+                           int nv,int in709,int out709,int w,int h,int scale,int start)
 {
     for(int y=start;y<h;y++) for(int x=0;x<w;x++) {
         int xx=((2*x+1)*128)/scale-128, yy=((2*y+1)*128)/scale-128;
@@ -184,8 +201,8 @@ static void preserve_y_cpu(unsigned char *Y,const unsigned char *s,int iw,int ih
         if(yy<0) yy=0; if(yy>(ih-1)*256) yy=(ih-1)*256;
         int x0=xx>>8,y0=yy>>8,x1=x0+1<iw ? x0+1 : iw-1,y1=y0+1<ih ? y0+1 : ih-1;
         int fx=xx&255,fy=yy&255;
-        int a=source_y(s,x0,y0,iw,ih,nv)*(256-fx)+source_y(s,x1,y0,iw,ih,nv)*fx;
-        int b=source_y(s,x0,y1,iw,ih,nv)*(256-fx)+source_y(s,x1,y1,iw,ih,nv)*fx;
+        int a=source_y(s,x0,y0,iw,ih,in_h,nv,in709,out709)*(256-fx)+source_y(s,x1,y0,iw,ih,in_h,nv,in709,out709)*fx;
+        int b=source_y(s,x0,y1,iw,ih,in_h,nv,in709,out709)*(256-fx)+source_y(s,x1,y1,iw,ih,in_h,nv,in709,out709)*fx;
         int v=(a*(256-fy)+b*fy+32768)>>16;
         int alpha=(y-start)*256/(4*scale); if(alpha>256) alpha=256;
         int i=y*w+x; Y[i]=(unsigned char)((v*alpha+Y[i]*(256-alpha)+128)>>8);
@@ -242,6 +259,10 @@ typedef struct {
     unsigned char *source[2];
     cl_mem mSource;
     cl_kernel k_text;
+    cl_kernel k_mix;
+    cl_kernel k_horizontal;
+    cl_mem mHorizontal;
+    int strength;
 } gpu_ctx_t;
 
 static void *gpu_thread(void *arg)
@@ -260,6 +281,17 @@ static void *gpu_thread(void *arg)
         e |= clEnqueueWriteBuffer(g->q, g->mB, CL_TRUE, 0, rgb, g->rgb[i] + px, 0, NULL, NULL);
         e |= clEnqueueWriteBuffer(g->q, g->mR, CL_TRUE, 0, rgb, g->rgb[i] + 2 * px, 0, NULL, NULL);
         (void)e;
+        if(g->k_text || g->k_mix)
+            CL_CHECK_OR_DIE(clEnqueueWriteBuffer(g->q,g->mSource,CL_TRUE,0,
+                g->source_bytes,g->source[i],0,NULL,NULL),"source upload");
+        if(g->k_mix) {
+            size_t hs[2]={(size_t)g->w,(size_t)g->ih};
+            CL_CHECK_OR_DIE(clEnqueueNDRangeKernel(g->q,g->k_horizontal,2,NULL,
+                hs,NULL,0,NULL,NULL),"source_horizontal");
+            size_t mix_size[2]={(size_t)g->w,(size_t)g->h};
+            CL_CHECK_OR_DIE(clEnqueueNDRangeKernel(g->q,g->k_mix,2,NULL,
+                mix_size,NULL,0,NULL,NULL),"source_mix");
+        }
         size_t gsz[2] = { ((size_t)g->w + 1) / 2, ((size_t)g->h + 1) / 2 };
         size_t lsz[2] = { 16, 4 };
         if (lsz[0] > gsz[0]) lsz[0] = gsz[0];
@@ -275,8 +307,6 @@ static void *gpu_thread(void *arg)
             clEnqueueNDRangeKernel(g->q, g->k_sh, 2, NULL, gs1, ls1, 0, NULL, NULL);
         }
         if (g->k_text) {
-            CL_CHECK_OR_DIE(clEnqueueWriteBuffer(g->q,g->mSource,CL_TRUE,0,
-                g->source_bytes,g->source[i],0,NULL,NULL),"text source");
             size_t text_size[2]={(size_t)g->w,(size_t)(g->h-g->text_start)};
             CL_CHECK_OR_DIE(clEnqueueNDRangeKernel(g->q,g->k_text,2,NULL,
                 text_size,NULL,0,NULL,NULL),"preserve_y");
@@ -313,7 +343,7 @@ typedef struct {
      *   VE 解码器的输出高按 16 对齐（960x540 的源它吐 960x544）：Y 平面是
      *   iw*in_h，UV 平面从 iw*in_h 开始，但我们只要前 ih 行。
      *   不给 --in-h 时 in_h = ih，行为与以前完全一致。 */
-    int iw, ih, in_h, tw, th, cw, ch, nx, ny, margin, in_nv12;
+    int iw, ih, in_h, tw, th, cw, ch, nx, ny, margin, in_nv12, in709;
     size_t frame_in, tile_in, all_tiles;
     unsigned char *src[3];            /* 主线程从管道读进来的整帧 gbrp */
     unsigned char *tiles[2];          /* GPU 收集出来的瓦片组 */
@@ -396,9 +426,13 @@ static const char *CL_IN_NV12_SRC =
 "    int c = (int)Yp[sy * iw + sx] - 16; if (c < 0) c = 0;\n"
 "    int ui = (sy >> 1) * iw + ((sx >> 1) << 1);\n"
 "    int d = (int)UV[ui] - 128, e = (int)UV[ui + 1] - 128;\n"
+"#if IN_BT709\n"
+"    int r=(298*c+459*e+128)>>8,g=(298*c-55*d-136*e+128)>>8,b=(298*c+541*d+128)>>8;\n"
+"#else\n"
 "    int r = (298 * c + 409 * e + 128) >> 8;\n"
 "    int g = (298 * c - 100 * d - 208 * e + 128) >> 8;\n"
 "    int b = (298 * c + 516 * d + 128) >> 8;\n"
+"#endif\n"
 "    r = r < 0 ? 0 : (r > 255 ? 255 : r);\n"
 "    g = g < 0 ? 0 : (g > 255 ? 255 : g);\n"
 "    b = b < 0 ? 0 : (b > 255 ? 255 : b);\n"
@@ -465,9 +499,9 @@ static void gather_nv12_cpu(const unsigned char *fin, unsigned char *tiles, cons
                     int c = (int)yrow[sx] - 16; if (c < 0) c = 0;
                     int d = (int)urow[(sx >> 1) << 1] - 128;
                     int e = (int)urow[((sx >> 1) << 1) + 1] - 128;
-                    int r = (298 * c + 409 * e + 128) >> 8;
-                    int gg = (298 * c - 100 * d - 208 * e + 128) >> 8;
-                    int b = (298 * c + 516 * d + 128) >> 8;
+                    int r = (298 * c + (g->in709?459:409) * e + 128) >> 8;
+                    int gg = (298 * c - (g->in709?55:100) * d - (g->in709?136:208) * e + 128) >> 8;
+                    int b = (298 * c + (g->in709?541:516) * d + 128) >> 8;
                     G[y * g->tw + x] = (unsigned char)(gg < 0 ? 0 : (gg > 255 ? 255 : gg));
                     B[y * g->tw + x] = (unsigned char)(b  < 0 ? 0 : (b  > 255 ? 255 : b));
                     R[y * g->tw + x] = (unsigned char)(r  < 0 ? 0 : (r  > 255 ? 255 : r));
@@ -518,6 +552,8 @@ int main(int argc, char **argv)
             "  --margin N         块间重叠圈\n"
             "  --nv12             输出 NV12\n"
             "  --sharpen F        锐化强度\n"
+            "  --strength F       AI 输出比例，0..1，默认 1；其余为原图 bicubic\n"
+            "  --input-matrix M / --output-matrix M  bt601 或 bt709（默认 bt601）\n"
             "  --preserve-bottom F 底部区域亮度保真，0..0.5，需要 --nv12\n"
             "  --gpu / --gpu-in   GPU 做输出转换 / GPU 抠块\n"
             "  --profile          打印各阶段耗时\n", argv[0]);
@@ -529,6 +565,8 @@ int main(int argc, char **argv)
     int margin = 0, out_nv12 = 0;
     float sharpen = 0.0f;
     float preserve_bottom = 0.0f;
+    float model_strength = 1.0f;
+    int in709=0,out709=0;
     int profile = 0, use_gpu = 0, use_gpu_in = 0, in_nv12 = 0;
     const char *dump_tiles = NULL;
     int force_float = 0;
@@ -541,6 +579,15 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atol(argv[++i]);
         else if (!strcmp(argv[i], "--sharpen") && i + 1 < argc) sharpen = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--preserve-bottom") && i + 1 < argc) preserve_bottom = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--strength") && i+1<argc) {
+            char *end=NULL;const char *v=argv[++i];model_strength=strtof(v,&end);
+            if(end==v || *end) die("AI 强度必须为数字");
+        }
+        else if ((!strcmp(argv[i],"--input-matrix") || !strcmp(argv[i],"--output-matrix")) && i+1<argc) {
+            int input=!strcmp(argv[i],"--input-matrix");const char *v=argv[++i];
+            if(strcmp(v,"bt601") && strcmp(v,"bt709")) die("矩阵只支持 bt601/bt709");
+            if(input)in709=!strcmp(v,"bt709");else out709=!strcmp(v,"bt709");
+        }
         else if (!strcmp(argv[i], "--profile")) profile = 1;
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--gpu-in")) use_gpu_in = 1;
@@ -550,6 +597,9 @@ int main(int argc, char **argv)
         else die("未知选项或选项缺少参数");
     }
     if (sharpen < 0.0f) sharpen = 0.0f;
+    if(!(model_strength>=0 && model_strength<=1)) die("AI 强度应为 0..1");
+    int strength=(int)(model_strength*256.0f+0.5f);
+    if(strength<256 && scale!=2 && scale!=4) die("保真混合只支持原生 x2/x4 模型");
     if (!(preserve_bottom >= 0.0f && preserve_bottom <= 0.5f)) die("字幕保护比例应为 0..0.5");
     if (preserve_bottom > 0 && !out_nv12) die("字幕保护需要 --nv12");
     if (iw <= 0 || ih <= 0 || scale <= 0 || tw <= 0 || th <= 0) die("参数不合法");
@@ -593,7 +643,7 @@ int main(int argc, char **argv)
     gin_t gin; memset(&gin, 0, sizeof(gin));
     gin.iw = iw; gin.ih = ih; gin.in_h = in_h; gin.tw = tw; gin.th = th;
     gin.cw = cw; gin.ch = ch; gin.nx = nx; gin.ny = ny; gin.margin = margin;
-    gin.in_nv12 = in_nv12;
+    gin.in_nv12 = in_nv12; gin.in709 = in709;
     /* --gpu-in 的内核把 UV 平面写死在 Y 之后（偏移 iw*ih），缓冲区也按 iw*ih 分配，
      * 装不下 in_h > ih 的输入。这条路本来就默认关、实测也没用（弱 GPU），
      * 与其去改内核，不如直接拒绝这个组合。 */
@@ -616,7 +666,7 @@ int main(int argc, char **argv)
             die("GPU 抠块内核编译失败");
         }
         cl_program pr2 = clCreateProgramWithSource(gin.ctx, 1, &CL_IN_NV12_SRC, NULL, &e);
-        if (clBuildProgram(pr2, 1, &dev, "-cl-fast-relaxed-math", NULL, NULL) != CL_SUCCESS) {
+        if (clBuildProgram(pr2, 1, &dev, in709 ? "-DIN_BT709=1" : "-DIN_BT709=0", NULL, NULL) != CL_SUCCESS) {
             char log[8192] = {0};
             clGetProgramBuildInfo(pr2, dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
             fprintf(stderr, "GPU NV12 抠块内核编译失败:\n%s\n", log);
@@ -739,8 +789,10 @@ int main(int argc, char **argv)
             die("找不到 OpenCL GPU（装了 img-bxm-dkms 吗？modprobe pvrsrvkm）");
         gpu.ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &e);
         gpu.q   = clCreateCommandQueue(gpu.ctx, dev, 0, &e);
-        cl_program pr = clCreateProgramWithSource(gpu.ctx, 1, &CL_SRC, NULL, &e);
-        if (clBuildProgram(pr, 1, &dev, "-cl-fast-relaxed-math", NULL, NULL) != CL_SUCCESS) {
+        const char *programs[]={CL_COLOUR_HELPERS,CL_SRC,CL_TEXT_SRC};
+        char build_opts[96];snprintf(build_opts,sizeof(build_opts),"-DINPUT_NV12=%d -DIN_BT709=%d -DOUT_BT709=%d",in_nv12,in709,out709);
+        cl_program pr = clCreateProgramWithSource(gpu.ctx,3,programs,NULL,&e);
+        if (clBuildProgram(pr, 1, &dev, build_opts, NULL, NULL) != CL_SUCCESS) {
             char log[8192] = {0};
             clGetProgramBuildInfo(pr, dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
             fprintf(stderr, "GPU 内核编译失败:\n%s\n", log);
@@ -748,9 +800,8 @@ int main(int argc, char **argv)
         }
         gpu.k    = clCreateKernel(pr, "gbrp2nv12_sharp", &e);
         gpu.k_sh = clCreateKernel(pr, "unsharp_y", &e);
-        clReleaseProgram(pr);  /* Kernels retain it; release before driver teardown. */
-        if (preserve_bottom > 0) {
-            gpu.iw=iw; gpu.ih=ih; gpu.in_h=in_h; gpu.nv=in_nv12; gpu.scale=scale;
+        if (preserve_bottom > 0 || strength < 256) {
+            gpu.iw=iw; gpu.ih=ih; gpu.in_h=in_h; gpu.nv=in_nv12; gpu.scale=scale;gpu.strength=strength;
             gpu.text_start=(int)(oh*(1.0f-preserve_bottom));
             gpu.source_bytes=frame_in;
             for(int i=0;i<2;i++) {
@@ -765,24 +816,35 @@ int main(int argc, char **argv)
             gpu.yuv[i] = (unsigned char *)malloc(frame_out);
             if (!gpu.rgb[i] || !gpu.yuv[i]) die("GPU 双缓冲 malloc 失败");
         }
-        gpu.mG  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
-        gpu.mB  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
-        gpu.mR  = clCreateBuffer(gpu.ctx, CL_MEM_READ_ONLY,  (size_t)ow * oh, NULL, &e);
+        gpu.mG  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE,  (size_t)ow * oh, NULL, &e);
+        gpu.mB  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE,  (size_t)ow * oh, NULL, &e);
+        gpu.mR  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE,  (size_t)ow * oh, NULL, &e);
         gpu.mY  = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, (size_t)ow * oh, NULL, &e);
         gpu.mYT = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE, (size_t)ow * oh, NULL, &e);
         gpu.mUV = clCreateBuffer(gpu.ctx, CL_MEM_WRITE_ONLY, (size_t)ow * oh / 2, NULL, &e);
         if (preserve_bottom > 0) {
-            cl_program tp=clCreateProgramWithSource(gpu.ctx,1,&CL_TEXT_SRC,NULL,&e);
-            CL_CHECK_OR_DIE(clBuildProgram(tp,1,&dev,
-                in_nv12 ? "-DINPUT_NV12=1" : "-DINPUT_NV12=0",NULL,NULL),"text program");
-            gpu.k_text=clCreateKernel(tp,"preserve_y",&e);
+            gpu.k_text=clCreateKernel(pr,"preserve_y",&e);
             CL_CHECK_OR_DIE(e,"text kernel");
             CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,0,sizeof(cl_mem),&gpu.mY),"text Y");
             CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,1,sizeof(cl_mem),&gpu.mSource),"text src");
             int args[]={iw,ih,in_h,in_nv12,ow,oh,scale,gpu.text_start};
             for(int a=0;a<8;a++) CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_text,a+2,sizeof(int),&args[a]),"text arg");
-            clReleaseProgram(tp);
         }
+        if(strength < 256) {
+            gpu.mHorizontal=clCreateBuffer(gpu.ctx,CL_MEM_READ_WRITE,(size_t)ow*ih*8,NULL,&e);
+            CL_CHECK_OR_DIE(e,"horizontal buffer");
+            gpu.k_horizontal=clCreateKernel(pr,"source_horizontal",&e);CL_CHECK_OR_DIE(e,"horizontal kernel");
+            CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_horizontal,0,sizeof(cl_mem),&gpu.mSource),"horizontal source");
+            CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_horizontal,1,sizeof(cl_mem),&gpu.mHorizontal),"horizontal out");
+            int hargs[]={iw,ih,in_h,scale};
+            for(int a=0;a<4;a++) CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_horizontal,a+2,sizeof(int),&hargs[a]),"horizontal arg");
+            gpu.k_mix=clCreateKernel(pr,"source_mix",&e);CL_CHECK_OR_DIE(e,"mix kernel");
+            cl_mem mems[]={gpu.mG,gpu.mB,gpu.mR,gpu.mHorizontal};
+            for(int a=0;a<4;a++) CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_mix,a,sizeof(cl_mem),&mems[a]),"mix buffer");
+            int args[]={iw,ih,in_h,scale,strength};
+            for(int a=0;a<5;a++) CL_CHECK_OR_DIE(clSetKernelArg(gpu.k_mix,a+4,sizeof(int),&args[a]),"mix arg");
+        }
+        clReleaseProgram(pr);
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 0, sizeof(cl_mem), &gpu.mG), "argG");
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 1, sizeof(cl_mem), &gpu.mB), "argB");
         CL_CHECK_OR_DIE(clSetKernelArg(gpu.k, 2, sizeof(cl_mem), &gpu.mR), "argR");
@@ -918,11 +980,13 @@ int main(int argc, char **argv)
         }
 
         _t0 = _ms();
+        if(!use_gpu && strength < 256)
+            sr_mix_cpu(fout,use_gpu_in ? gin.src[gin.slot_in] : fin,iw,ih,in_h,in_nv12,in709,scale,strength);
         if (use_gpu) {
             /* 把刚拼好的整帧交给 GPU 线程，自己不转 —— NPU 立刻去啃下一帧 */
             sem_wait(&gpu.empty);
             memcpy(gpu.rgb[gpu.idx_in], fout, rgb_bytes);
-            if(gpu.k_text) memcpy(gpu.source[gpu.idx_in],
+            if(gpu.k_text || gpu.k_mix) memcpy(gpu.source[gpu.idx_in],
                 use_gpu_in ? gin.src[gin.slot_in] : fin,frame_in);
             gpu.idx_in ^= 1;
             gpu.posted++;
@@ -949,7 +1013,7 @@ int main(int argc, char **argv)
                 for (int x = 0; x < ow; x++) {
                     int r = rp[x], g = gp[x], b = bp[x];
                     /* BT.601 limited: 0.2568/0.5041/0.0979, 16..235 */
-                    int v = ((16829 * r + 33039 * g + 6416 * b) >> 16) + 16;
+                    int v = out709 ? ((11966*r+40254*g+4064*b)>>16)+16 : ((16829*r+33039*g+6416*b)>>16)+16;
                     if (v < 16) v = 16; else if (v > 235) v = 235;
                     yp[x] = (unsigned char)v;
                 }
@@ -970,8 +1034,8 @@ int main(int argc, char **argv)
                     }
                     int r = sr >> 2, g = sg >> 2, b = sb >> 2;
                     /* BT.601 limited 色差: -0.1482/-0.2914/+0.4392 与 +0.4392/-0.3678/-0.0714 */
-                    int cb = ((-9711 * r - 19098 * g + 28784 * b) >> 16) + 128;
-                    int cr = (( 28784 * r - 24103 * g - 4681 * b) >> 16) + 128;
+                    int cb = out709 ? ((-6596*r-22188*g+28784*b)>>16)+128 : ((-9711*r-19098*g+28784*b)>>16)+128;
+                    int cr = out709 ? ((28784*r-26145*g-2639*b)>>16)+128 : ((28784*r-24103*g-4681*b)>>16)+128;
                     if (cb < 16) cb = 16; else if (cb > 240) cb = 240;
                     if (cr < 16) cr = 16; else if (cr > 240) cr = 240;
                     uvp[x]     = (unsigned char)cb;
@@ -1005,7 +1069,7 @@ int main(int argc, char **argv)
             }
             t_sh += _ms()-_t0; _t0=_ms();
             if(preserve_bottom>0) preserve_y_cpu(yuv,
-                use_gpu_in ? gin.src[gin.slot_in] : fin,iw,ih,in_nv12,ow,oh,
+                use_gpu_in ? gin.src[gin.slot_in] : fin,iw,ih,in_h,in_nv12,in709,out709,ow,oh,
                 scale,(int)(oh*(1.0f-preserve_bottom)));
             write_full(data_fd, yuv, frame_out);
             t_wr += _ms()-_t0;
@@ -1031,8 +1095,12 @@ int main(int argc, char **argv)
         sem_post(&gpu.full);            /* 唤醒它去看到 stop */
         pthread_join(gpu_tid, NULL);
         clFinish(gpu.q);
-        if(gpu.k_text) {
-            clReleaseKernel(gpu.k_text);
+        if(gpu.k_text) clReleaseKernel(gpu.k_text);
+        if(gpu.k_mix) {
+            clReleaseKernel(gpu.k_mix);clReleaseKernel(gpu.k_horizontal);
+            clReleaseMemObject(gpu.mHorizontal);
+        }
+        if(gpu.k_text || gpu.k_mix) {
             clReleaseMemObject(gpu.mSource);
             for(int i=0;i<2;i++) free(gpu.source[i]);
         }
