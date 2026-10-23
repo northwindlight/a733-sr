@@ -228,6 +228,7 @@ Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `SR_PORT` | `8080` | Web 服务端口 |
+| `SR_KEEP_JOBS` | `16` | 任务与成品保留数，超过后自动清理最旧的已结束任务及其成品 |
 | `SR_VIP_LIB` | `vendor/viplite` | VIP Lite 运行库目录 |
 | `SR_VENC_DIR` | `vendor/venc` | `libvencoder` 那一套（含 `vencoderdemo_v2`） |
 | `SR_VENC_BIN` | `$SR_VENC_DIR/vencoderdemo_v2` | VE 编码器 demo 可执行文件 |

@@ -1056,7 +1056,7 @@ def sweep_stale():
         print(f"清理了 {n} 个僵死任务", flush=True)
 
 
-KEEP_JOBS = int(_env("SR_KEEP_JOBS", "8"))
+KEEP_JOBS = int(_env("SR_KEEP_JOBS", "16"))
 
 
 def sweep_old(jid=None):
