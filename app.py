@@ -85,16 +85,24 @@ CHUNK_FRAMES   = int(_env("SR_CHUNK_FRAMES", "300"))
 
 # 每个任务固定自己的模型与几何，不能在全局变量间切换（HTTP 请求可并发）。
 MODELS = {
+    "rrdb": {"name": "RealESRGAN x2plus · 画质优先 · 原生 2 倍", "scale": 2,
+             "path": os.path.join(BASE, "models", "realesrgan_x2plus.nb"),
+             "tile_w": 352, "tile_h": 224, "margin": 64,
+             "input_int16": True,
+             "auto_strength": 1.0,
+             "note": "完整 RRDB 大模型，速度较慢；原生 2 倍，更高倍率用 Lanczos 继续放大。自动强度为 100%。"},
     "animejanai": {"name": "AnimeJaNai HD V3 · 原生 2 倍", "scale": 2,
                   "path": os.path.join(BASE, "models", "animejanai_v3_x2.nb"),
-                  "tile_w": 352, "tile_h": 224, "margin": 16},
+                  "tile_w": 352, "tile_h": 224, "margin": 16,
+                  "note": "轻量动画模型；原生 2 倍，更高倍率用 Lanczos 继续放大。高清输入自动混合原图以减轻涂抹。"},
     "anime": {"name": "AnimeVideo v3 · 原生 4 倍（旧模型）", "scale": 4,
               "path": NBG, "tile_w": TILE_W, "tile_h": TILE_H, "margin": MARGIN},
     "general": {"name": "RealESR General v3 · 原生 4 倍", "scale": 4,
                 "path": os.path.join(BASE, "models", "realesr_general_352x224.nb"),
                 "tile_w": 352, "tile_h": 224, "margin": 36},
 }
-DEFAULT_MODEL = _env("SR_DEFAULT_MODEL", "animejanai" if os.path.isfile(MODELS["animejanai"]["path"]) else "anime")
+DEFAULT_MODEL = _env("SR_DEFAULT_MODEL", next(
+    (k for k in ("rrdb", "animejanai", "anime") if os.path.isfile(MODELS[k]["path"])), "anime"))
 
 
 def model_config(model_id=None):
@@ -430,7 +438,7 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, prese
     W, H = meta["w"], meta["h"]
     strength = parse_strength(strength)
     if strength is None:
-        strength = 0.35 if H >= 720 else 1.0
+        strength = model.get("auto_strength", 0.35 if H >= 720 else 1.0)
     input_matrix = "bt709" if meta["color_space"] == "bt709" else "bt601"
     fps = meta["fps"] or 30.0
     # 精确帧率（有理数）。ffprobe 给不出有效值时才退回按毫秒近似的那个。
@@ -555,6 +563,8 @@ def pipeline(jid, src, scale, target_h, t_start, sharp=0.0, model_id=None, prese
         sh_arg = f" --sharpen {sharp}" if sharp and sharp > 0 else ""
         sh_arg += f" --preserve-bottom {preserve}"
         sh_arg += f" --strength {strength} --input-matrix {input_matrix} --output-matrix bt709"
+        if model.get("input_int16"):
+            sh_arg += " --input-int16"
         # ★GPU 做色彩转换，和 NPU 并行。选它不是因为它快（实测比 CPU 慢），
         #   是因为 CPU 是那个 60°C 就降频的热区，把活挪走能少降频。
         gpu_arg = " --gpu" if GPU_CONV else ""
@@ -919,7 +929,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if urlparse(self.path).path == "/api/models":
             return self._json({"default": DEFAULT_MODEL, "models": [
-                {"id": k, "name": v["name"], "scale": v["scale"]}
+                {"id": k, "name": v["name"], "scale": v["scale"],
+                 "note": v.get("note", "原生 4 倍；可按所选输出分辨率缩小。")}
                 for k, v in MODELS.items() if os.path.isfile(v["path"])]})
         u = urlparse(self.path)
         q = parse_qs(u.query)

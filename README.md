@@ -6,23 +6,27 @@
 ```
 浏览器 ──► Caddy ──► app.py ──┬─ 上传 / b23 链接（yt-dlp）
                               └─ ffmpeg 解码
-                                   └ srpipe   ← NPU 分块 x4 超分（本仓库的核心）
-                                       └ ffmpeg 缩放 + CAS 锐化
+                                   └ srpipe   ← NPU 分块 x2/x4 + GPU 色彩转换
+                                       └ ffmpeg 按需缩放
                                            └ vencoderdemo  ← VE 硬编 H.264
                                                └ ffmpeg 混音轨 → mp4
 ```
 
 ---
 
-## 现行默认：MMD / 动画与字幕
+## 现行默认：原生两倍 RRDB 与字幕保护
 
-默认模型为 **AnimeJaNai HD V3 UltraCompact（原生 x2）**，输入块 352×224。
-网页可选旧 AnimeVideo x4 或通用 RealESR General x4（安装了对应文件才显示）。
+默认模型为 **RealESRGAN_x2plus（原生 x2）**：23 个 RRDB 块、约 16.7M 参数，
+输入块 352×224，重叠 64 像素，使用 INT16 动态定点，处理速度明显慢于旧轻量模型。
+网页保留 AnimeJaNai HD V3 UltraCompact、旧 AnimeVideo x4 和 General v3 x4
+（安装了对应文件才显示）；未安装 x2plus 的旧部署继续默认 AnimeJaNai。
+完整 RRDB 与 `realesr-general-x4v3` 小型 SRVGG 是不同网络。
 原生 x2 以上的输出尺寸使用 Lanczos 继续放大，界面有说明；原生 x2 不等于原生 x4。
 
 - 修正了 gbrp 的 G/B/R 与模型 R/G/B 通道顺序；抠块转 RGB，拼帧转回 GBR。
-- 新增 **AI 强度**：自动对 720p 及以上使用约 35% 模型输出、其余为原图 bicubic，
-  避免轻量模型抹掉 MMD 纹理。更低分辨率保留 100% 模型输出，可手动改为 35% / 65% / 100%。
+- **AI 强度**：x2plus 自动为 **100%**，直接使用完整模型输出。
+  旧轻量模型自动对 720p 及以上使用约 35% 模型输出、其余为原图 bicubic，
+  减轻涂抹；更低分辨率为 100%。所有模型均可手动改为 35% / 65% / 100%。
   原图混合保留已有细节与压缩痕迹，不保证对所有素材都优于原片；先比较短片再整片处理。
 - 默认关闭后置锐化。默认**底部 20% 字幕保护**：该区域的亮度按源图双线性插值，
   保留原始字形；色度仍来自模型。边界渐变 4 个源像素。可选底部 30% 或关闭。
@@ -34,15 +38,27 @@
 - NBG 形状/倍率不匹配、未知命令行参数直接拒绝，防止静默坏图。
 - 补齐 VE 硬解遗漏的 1–2 个尾帧，明确每包时长；已知源帧数对不上就报错。
 
-模型由 [the-database](https://github.com/the-database/mpv-AnimeJaNai/releases/tag/3.0.0)
+RealESRGAN_x2plus 来自 [官方发布](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.1)，
+权重 BSD-3-Clause，架构源自 BasicSR（Apache-2.0）。静态导出把输入像素重排与
+第一层卷积等价合并，DIV2K 32 张图（其中 16 张加字幕和细线）校准；源码、许可证和权重 SHA256 见
+[a733-npu 模型目录](https://github.com/northwindlight/a733-npu/tree/main/models/realesrgan_x2plus)。
+
+旧 AnimeJaNai 模型由 [the-database](https://github.com/the-database/mpv-AnimeJaNai/releases/tag/3.0.0)
 训练，权重及其 NBG 变体遵守 [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)。
-修改内容：静态 ONNX 导出、DIV2K 16 张图校准、A733 uint8 NBG 编译。
-模型构建源码与 SHA256 见 [a733-npu](https://github.com/northwindlight/a733-npu/tree/main/models/animejanai_v3_x2)。
+修改内容：静态 ONNX 导出、准备 DIV2K 16 张图、A733 uint8 NBG 编译。
+旧发布产物的量化工具实际默认只迭代 1 次；转换栈现已修正，旧产物保持原样。
+旧模型构建源码与 SHA256 见 [a733-npu](https://github.com/northwindlight/a733-npu/tree/main/models/animejanai_v3_x2)。
 服务代码仍为 MPL-2.0，模型许可单独适用。
 
-验收与性能记录见 [2026-10-21 验证报告](docs/20261021-validation.md)、[1080p MMD 画质修复](docs/20261023-quality.md)。
+RRDB 主画面取样与浮点参考一致性约 **44 dB**；这不是相对真实 4K 的画质分数。
+字幕重建尚未验收，仍使用现有手动底部保护，后续再实现视觉提取。
+本模型比旧轻量模型慢很多，1080p→4K 单帧实测约 **158 秒**；实测与限制见
+[RRDB 验证报告](docs/20261023-rrdb.md)。
+早期记录见 [2026-10-21 验证报告](docs/20261021-validation.md)、[1080p MMD 画质修复](docs/20261023-quality.md)。
 
 ## 这块板子的实际水平（全部实测，非规格推算）
+
+下面的早期超分速度对应旧 AnimeVideo，不能套用于现行 RRDB 模型。
 
 | | 实测 |
 |---|---|
@@ -215,7 +231,7 @@ Release 拉取预编译的 NBG，也会在 `~/ai-sdk/examples/` 找 awnn 源码�
 | `SR_VIP_LIB` | `vendor/viplite` | VIP Lite 运行库目录 |
 | `SR_VENC_DIR` | `vendor/venc` | `libvencoder` 那一套（含 `vencoderdemo_v2`） |
 | `SR_VENC_BIN` | `$SR_VENC_DIR/vencoderdemo_v2` | VE 编码器 demo 可执行文件 |
-| `SR_DEFAULT_MODEL` | `animejanai`（已安装时） | 默认模型；`anime` 为旧动画，`general` 为通用 |
+| `SR_DEFAULT_MODEL` | `rrdb`（已安装时） | 默认模型；`animejanai` 为旧轻量 x2，`anime` 为旧动画 x4，`general` 为通用小模型 x4 |
 | `SR_NBG` | `models/anv3_352x224.nb` | 覆盖旧动画模型路径，几何仍为 x4 / 352×224 |
 | `SR_CHUNK_FRAMES` | `300` | 分段帧数，临时文件另受约 2 GB 上限限制 |
 | `SR_COOKIES` | `bili_cookies.txt` | 哔哩哔哩 cookie（可选，**别提交**） |

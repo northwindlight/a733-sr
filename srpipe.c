@@ -44,6 +44,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdint.h>
+#include <math.h>
 #include <awnn_lib.h>
 /* ★awnn_internal.h 只为拿 Awnn_Context_t 的结构定义（要绕开 awnn_run 的浮点反量化）。
  *   它没有 include guard，而且里面是【定义】了两个全局数组 time_begin/time_end
@@ -546,6 +548,7 @@ int main(int argc, char **argv)
             "  读 stdin 的帧（默认 gbrp 平面，--in-nv12 则读 NV12），\n"
             "  输出 scale 倍大的帧（默认 gbrp，--nv12 则输出 NV12）\n"
             "  --in-nv12          输入是 NV12（Y 平面 + 交织 CbCr）\n"
+            "  --input-int16      NBG 输入为归一化 0..1 的 INT16 动态定点\n"
             "  --in-h H           输入缓冲区实际高（默认 = in_h 参数）。\n"
             "                     VE 解码器输出高按 16 对齐，靠它把补的行裁掉\n"
             "  --frames N         只处理 N 帧就正常退出（流式分段用）\n"
@@ -570,6 +573,7 @@ int main(int argc, char **argv)
     int profile = 0, use_gpu = 0, use_gpu_in = 0, in_nv12 = 0;
     const char *dump_tiles = NULL;
     int force_float = 0;
+    int input_int16 = 0;
     int in_h = 0;                 /* 输入缓冲区高，0 = 跟 ih 一样 */
     long max_frames = 0;          /* >0 = 只处理这么多帧就正常收工 */
     for (int i = 7; i < argc; i++) {
@@ -592,6 +596,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--gpu")) use_gpu = 1;
         else if (!strcmp(argv[i], "--gpu-in")) use_gpu_in = 1;
         else if (!strcmp(argv[i], "--in-nv12")) in_nv12 = 1;
+        else if (!strcmp(argv[i], "--input-int16")) input_int16 = 1;
         else if (!strcmp(argv[i], "--float-out")) force_float = 1;   /* A/B 用：强制走 awnn 浮点路 */
         else if (!strcmp(argv[i], "--dump-tiles") && i + 1 < argc) dump_tiles = argv[++i];
         else die("未知选项或选项缺少参数");
@@ -731,8 +736,16 @@ int main(int argc, char **argv)
     awnn_init();
     Awnn_Context_t *ctx = awnn_create(nbg);
     if (!ctx) die("awnn_create 失败");
-    if (ctx->input_count != 1 || ctx->output_count != 1 ||
-        ctx->input_params[0].vip_param.data_format != VIP_BUFFER_FORMAT_UINT8 ||
+    if (ctx->input_count != 1 || ctx->output_count != 1)
+        die("NBG 必须为单输入、单输出");
+    const vip_buffer_create_params_t *ip = &ctx->input_params[0].vip_param;
+    if ((!input_int16 && ip->data_format != VIP_BUFFER_FORMAT_UINT8) ||
+        (input_int16 && (ip->data_format != VIP_BUFFER_FORMAT_INT16 ||
+                        ip->quant_format != VIP_BUFFER_QUANTIZE_DYNAMIC_FIXED_POINT)))
+        die("NBG 输入格式不匹配：归一化 INT16 DFP 模型需要 --input-int16，UINT8 模型不能使用该选项");
+    if (vip_get_buffer_size(ctx->input_buffers[0]) != tile_in * (input_int16 ? 2 : 1))
+        die("NBG 输入缓冲区不是紧密排列，不能直接传入瓦片");
+    if (
         ctx->input_params[0].vip_param.sizes[0] != (unsigned)tw ||
         ctx->input_params[0].vip_param.sizes[1] != (unsigned)th ||
         ctx->input_params[0].vip_param.sizes[2] != 3 ||
@@ -742,6 +755,22 @@ int main(int argc, char **argv)
         ctx->output_params[0].vip_param.sizes[2] != 3 ||
         ctx->output_params[0].elements != tile_out_bytes)
         die("NBG 输入/输出形状与块尺寸或倍率不匹配");
+
+    /* INT16 model inputs are normalized RGB, unlike the raw UINT8 interface.
+     * Keep this explicit: blindly copying bytes into a two-byte tensor would
+     * over-read the tile and silently feed the model garbage. */
+    int16_t input_lut[256];
+    int16_t *input_q16 = NULL;
+    if (input_int16) {
+        input_q16 = (int16_t *)malloc(tile_in * sizeof(int16_t));
+        if (!input_q16) die("INT16 输入缓冲区分配失败");
+        int fl = ip->quant_data.dfp.fixed_point_pos;
+        for (int j=0;j<256;j++) {
+            float v=ldexpf((float)j/255.0f,fl);
+            input_lut[j]=(int16_t)(v>=32767.0f ? 32767 : (v<=0 ? 0 : lrintf(v)));
+        }
+        fprintf(stderr,"srpipe: normalized RGB -> INT16 DFP input (fl=%d)\n",fl);
+    }
 
     /* ★★ 绕开 awnn_run 的浮点反量化。
      *
@@ -914,7 +943,14 @@ int main(int argc, char **argv)
         for (int ty = 0; ty < ny; ty++) {
             for (int tx = 0; tx < nx; tx++) {
                 /* 瓦片已经在 tb 里排好了，这里只是换个指针 —— 一次拷贝都没有 */
-                in_buffers[0] = tb + (size_t)(ty * nx + tx) * tile_in;
+                const unsigned char *input_tile = tb + (size_t)(ty * nx + tx) * tile_in;
+                in_buffers[0] = (void *)input_tile;
+                if (input_int16) {
+                    double tq = _ms();
+                    for (size_t j=0;j<tile_in;j++) input_q16[j]=input_lut[input_tile[j]];
+                    in_buffers[0]=input_q16;
+                    t_tile += _ms()-tq;
+                }
                 double _t1 = _ms();
                 awnn_set_input_buffers(ctx, in_buffers);
                 int lim = scw;
@@ -1111,6 +1147,7 @@ int main(int argc, char **argv)
     }
     awnn_destroy(ctx);
     awnn_uninit();
+    free(input_q16);
     close(data_fd);
     if (use_gpu_in)
         fprintf(stderr, "GPU 抠块: %ld 帧，合计 %.0f ms => %.2f ms/帧（与 NPU 并行）\n",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hardware regression for source fidelity and BT.601/709 (native x2 model).
-SR_SRPIPE=/path/srpipe SR_NBG=/path/animejanai_v3_x2.nb python3 tools/qualitycheck.py
+SR_SRPIPE=/path/srpipe SR_NBG=/path/model.nb SR_MARGIN=64 SR_INPUT_INT16=1 python3 tools/qualitycheck.py
 """
 import os
 from pathlib import Path
@@ -10,12 +10,14 @@ import numpy as np
 
 binary=os.environ.get('SR_SRPIPE','/opt/sr/srpipe')
 model=os.environ.get('SR_NBG','/opt/sr/models/animejanai_v3_x2.nb')
+margin=os.environ.get('SR_MARGIN','16')
 w,h,ah=64,40,48
 rng=np.random.default_rng(20261023)
 rgb=rng.integers(0,256,(h,w,3),dtype=np.uint8)
 gbr=rgb.transpose(2,0,1)[[1,2,0]].tobytes()
 nv=np.concatenate([rng.integers(16,236,w*ah,dtype=np.uint8),rng.integers(16,241,w*ah//2,dtype=np.uint8)]).tobytes()
-base=[binary,model,str(w),str(h),'2','352','224','--margin','16']
+base=[binary,model,str(w),str(h),'2','352','224','--margin',margin]
+if os.environ.get('SR_INPUT_INT16')=='1': base.append('--input-int16')
 def run(data,*args):
  p=subprocess.run(base+list(args),input=data,capture_output=True)
  if p.returncode: raise RuntimeError(p.stderr.decode(errors='replace'))

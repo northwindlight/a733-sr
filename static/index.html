@@ -164,7 +164,7 @@
         <option value="1">100% · 完整模型输出</option>
       </select>
     </div>
-    <div style="color:var(--dim);font-size:12px;margin:0 0 12px">MMD 或画面有涂抹感时可降低 AI 强度。自动对 720p 及以上使用 35%，更低分辨率使用 100%。</div>
+    <div style="color:var(--dim);font-size:12px;margin:0 0 12px">自动：x2plus 使用 100%；旧轻量模型对 720p 及以上使用 35%，更低分辨率使用 100%。降低强度会混合原图插值。</div>
     <div class="fields">
       <label>字幕保护</label>
       <select id="preserve">
@@ -588,9 +588,7 @@ fetch('/api/models').then(r=>r.json()).then(d=>{
   $('#model').innerHTML=d.models.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
   $('#model').value=d.default;
   $('#model').onchange=()=>{
-    $('#modelNote').textContent=$('#model').value==='animejanai'
-      ? '适合 MMD / 动画；原生 2 倍，更高分辨率用 Lanczos 继续放大。'
-      : '原生 4 倍；可按所选输出分辨率缩小。';
+    $('#modelNote').textContent=d.models.find(m=>m.id===$('#model').value)?.note || '';
   };
   $('#model').onchange();
 }).catch(()=>{ $('#modelNote').textContent='模型列表加载失败，请刷新页面'; });

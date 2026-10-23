@@ -12,10 +12,10 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 SR_DIR=${SR_DIR:-/opt/sr}
 RUN_USER=${SR_RUN_USER:-${SUDO_USER:-$(id -un)}}
 AI_SDK=${AI_SDK:-$HOME/ai-sdk}
-NBG_BASE=https://github.com/northwindlight/a733-npu/releases/download/nbg-animejanai_v3_x2-v3
+NBG_BASE=https://github.com/northwindlight/a733-npu/releases/download/nbg-realesrgan_x2plus-v3
 NBG_URL=${NBG_URL:-$NBG_BASE/network_binary.nb}
 NBG_INFO_URL=${NBG_INFO_URL:-$NBG_BASE/build_info.json}
-NBG_NAME=${NBG_NAME:-animejanai_v3_x2.nb}
+NBG_NAME=${NBG_NAME:-realesrgan_x2plus.nb}
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; exit 1; }

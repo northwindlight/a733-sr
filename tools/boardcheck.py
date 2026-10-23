@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A733 hardware checks: source strokes, GPU/CPU, dequant and padded decoder.
 
-SR_SRPIPE=/path/srpipe SR_NBG=/path/animejanai_v3_x2.nb python3 tools/boardcheck.py input.png
+SR_SRPIPE=/path/srpipe SR_NBG=/path/model.nb SR_MARGIN=64 SR_INPUT_INT16=1 python3 tools/boardcheck.py input.png
 Uses the native x2, 352x224 model. Does not modify the running web service.
 """
 import os
@@ -14,6 +14,7 @@ import numpy as np
 
 binary = os.environ.get("SR_SRPIPE", "/opt/sr/srpipe")
 model = os.environ.get("SR_NBG", "/opt/sr/models/animejanai_v3_x2.nb")
+margin = os.environ.get("SR_MARGIN", "16")
 source = sys.argv[1]
 
 
@@ -33,7 +34,9 @@ with tempfile.TemporaryDirectory(prefix="sr-boardcheck-") as temp:
                "scale=320:180", "-pix_fmt", "gbrp", "-f", "rawvideo", "-"]).stdout
     nv = run(["ffmpeg", "-v", "error", "-i", source, "-frames:v", "1", "-vf",
               "scale=320:180,pad=320:192:0:0", "-pix_fmt", "nv12", "-f", "rawvideo", "-"]).stdout
-    base = [binary, model, str(w), str(h), "2", "352", "224", "--margin", "16"]
+    base = [binary, model, str(w), str(h), "2", "352", "224", "--margin", margin]
+    if os.environ.get("SR_INPUT_INT16") == "1":
+        base.append("--input-int16")
 
     def infer(data, *args):
         return run(base + list(args), input=data).stdout
@@ -73,8 +76,11 @@ with tempfile.TemporaryDirectory(prefix="sr-boardcheck-") as temp:
     for opts in [["--unknown-option"], ["--preserve-bottom", "nan", "--nv12"]]:
         result = subprocess.run(base + opts, input=b"", capture_output=True)
         assert result.returncode != 0, "invalid option silently accepted"
+    wrong_type = [x for x in base if x != "--input-int16"] if "--input-int16" in base else base + ["--input-int16"]
+    result = subprocess.run(wrong_type, input=gbr, capture_output=True)
+    assert result.returncode != 0 and "输入格式" in result.stderr.decode(), "wrong input dtype silently accepted"
     mismatch = base.copy()
     mismatch[4] = "4"
     result = subprocess.run(mismatch, input=gbr, capture_output=True)
     assert result.returncode != 0 and "NBG" in result.stderr.decode()
-    print("PASS unknown options, NaN protection and mismatched NBG scale are rejected")
+    print("PASS unknown options, NaN protection, input dtype and mismatched NBG scale are rejected")
